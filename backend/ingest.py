@@ -9,8 +9,8 @@ Architecture:
 Design Decisions:
     1. Dual Source Support: Handles both live RTSP streams and local video files (.mp4).
     2. Real-Time Simulation for Local Files: When ingesting a local video file,
-       enforces a precision sleep timer in the producer loop to simulate 1x real-time
-       playback (e.g., 30 FPS or configured FPS). This guarantees that inter-frame
+       dynamically sleeps for the remaining frame interval to simulate 1x real-time
+       playback at the configured FPS. This guarantees that inter-frame
        temporal velocities (dx/dt) calculated by the inference heuristics behave
        identically between live camera streams and pre-recorded test footage.
     3. Queue(maxsize=1): Only the LATEST frame survives. This prevents memory leaks
@@ -246,7 +246,7 @@ class FrameProducer:
             1. If webcam: run native OpenCV capture loop.
             2. If RTSP or local video: spawn FFmpeg subprocess.
             3. Push to Queue(maxsize=1) with drop-old policy.
-            4. If local file: enforce high-precision sleep timer simulating 1x real-time playback.
+            4. If local file: pace frames with a dynamic sleep timer for 1x real-time playback.
             5. On failure or EOF: cleanup and restart/reconnect if required.
         """
         # Ignore SIGINT in child process — parent handles orchestration
@@ -321,14 +321,13 @@ class FrameProducer:
 
                 # === 1x REAL-TIME SIMULATION SLEEP TIMER ===
                 # When reading a local file, FFmpeg decodes faster than real-time.
-                # Sleeping ensures inter-frame delta-t matches real camera wall-clock time,
-                # keeping temporal velocity heuristics (px/frame) calibrated.
+                # Sleep only for the remainder of this frame's target interval so
+                # read/queue time is accounted for and the schedule does not drift.
                 if self._is_local and self.config.simulate_realtime:
                     next_frame_time += frame_interval
                     sleep_dur = next_frame_time - time.perf_counter()
                     if sleep_dur > 0:
-                        if self.shutdown_event.wait(timeout=sleep_dur):
-                            break
+                        time.sleep(sleep_dur)
                     elif sleep_dur < -0.2:
                         # Prevent accumulation of negative deficit if pipeline stalls
                         next_frame_time = time.perf_counter()

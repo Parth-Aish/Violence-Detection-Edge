@@ -33,6 +33,7 @@ import json
 import logging
 import multiprocessing
 import os
+import tempfile
 import signal
 import sys
 import time
@@ -42,7 +43,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -61,6 +62,7 @@ FRAME_FPS = int(os.getenv("FRAME_FPS", "15"))
 MODEL_PATH = os.getenv("MODEL_PATH", "yolov8n-pose.pt")
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "70"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(500 * 1024 * 1024)))
 
 # ──────────────────────────────────────────────
 # Logging setup
@@ -81,6 +83,11 @@ _ingest_process: Optional[multiprocessing.Process] = None
 _classifier: Optional[TemporalVelocityClassifier] = None
 _incident_logger: Optional[IncidentLogger] = None
 _inference_task: Optional[asyncio.Task] = None
+_active_upload_path: Optional[Path] = None
+_active_source = STREAM_SOURCE
+_source_generation = 0
+_source_lock = asyncio.Lock()
+_classifier_lock = asyncio.Lock()
 
 # WebSocket client registry
 _ws_clients: set[WebSocket] = set()
@@ -173,22 +180,37 @@ async def _inference_loop():
     
     while True:
         try:
+            frame_queue = _frame_queue
+            source_generation = _source_generation
+            if frame_queue is None:
+                await asyncio.sleep(0.05)
+                continue
+
             # Pull frame from queue (run in executor to avoid blocking event loop)
             try:
                 frame = await loop.run_in_executor(
-                    None, lambda: _frame_queue.get(timeout=1.0)
+                    None, lambda: frame_queue.get(timeout=1.0)
                 )
             except Exception:
                 await asyncio.sleep(0.01)
+                continue
+
+            if source_generation != _source_generation:
                 continue
             
             frame_count += 1
             
             # Run inference in executor (CPU-bound)
-            detections = await loop.run_in_executor(
-                None, _classifier.process_frame, frame
-            )
-            
+            async with _classifier_lock:
+                if source_generation != _source_generation:
+                    continue
+                detections = await loop.run_in_executor(
+                    None, _classifier.process_frame, frame
+                )
+
+            if source_generation != _source_generation:
+                continue
+
             # Log incidents
             if detections:
                 logged = await loop.run_in_executor(
@@ -218,6 +240,7 @@ async def _inference_loop():
                 "type": "frame",
                 "data": jpeg_b64,
                 "detections": len(detections),
+                "is_violence": bool(detections),
                 "timestamp": time.time(),
             })
             
@@ -248,7 +271,7 @@ async def lifespan(app: FastAPI):
         3. Incident logger
         4. Background inference task
     """
-    global _frame_queue, _shutdown_event, _ingest_process
+    global _frame_queue, _shutdown_event, _ingest_process, _active_source
     global _classifier, _incident_logger, _inference_task
     
     log.info("=" * 60)
@@ -282,6 +305,8 @@ async def lifespan(app: FastAPI):
             source = str(demo_path)
         else:
             log.info(f"Using webcam index: {source}")
+
+    _active_source = source
     
     _ingest_process, _frame_queue, _shutdown_event = create_ingestion_pipeline(
         source=source,
@@ -309,13 +334,9 @@ async def lifespan(app: FastAPI):
             pass
     
     # Stop ingestion process
-    if _shutdown_event:
-        _shutdown_event.set()
-    if _ingest_process and _ingest_process.is_alive():
-        _ingest_process.join(timeout=10)
-        if _ingest_process.is_alive():
-            _ingest_process.kill()
-            log.warning("Ingestion process force-killed.")
+    _stop_ingestion(_ingest_process, _shutdown_event)
+    if _active_upload_path:
+        _active_upload_path.unlink(missing_ok=True)
     
     # Close WebSocket clients
     async with _ws_lock:
@@ -349,6 +370,73 @@ app.add_middleware(
 )
 
 
+def _stop_ingestion(
+    process: Optional[multiprocessing.Process],
+    shutdown_event: Optional[multiprocessing.Event],
+) -> None:
+    """Stop an ingestion worker and reap its process."""
+    if shutdown_event:
+        shutdown_event.set()
+    if process and process.is_alive():
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            if process.is_alive():
+                raise RuntimeError("Ingestion process did not stop after termination.")
+
+
+async def _swap_ingestion_source(source: str, *, loop_file: bool, upload_path: Optional[Path] = None) -> None:
+    """Start a replacement producer, then atomically make it the active source."""
+    global _frame_queue, _shutdown_event, _ingest_process
+    global _active_upload_path, _active_source, _source_generation
+
+    async with _source_lock:
+        new_process, new_queue, new_shutdown_event = create_ingestion_pipeline(
+            source=source,
+            width=FRAME_WIDTH,
+            height=FRAME_HEIGHT,
+            fps=FRAME_FPS,
+            loop_file=loop_file,
+            simulate_realtime=True,
+        )
+        try:
+            new_process.start()
+        except Exception:
+            new_shutdown_event.set()
+            raise
+
+        old_process = _ingest_process
+        old_shutdown_event = _shutdown_event
+        old_upload_path = _active_upload_path
+
+        try:
+            _stop_ingestion(old_process, old_shutdown_event)
+        except Exception:
+            _stop_ingestion(new_process, new_shutdown_event)
+            raise
+
+        _ingest_process = new_process
+        _frame_queue = new_queue
+        _shutdown_event = new_shutdown_event
+        _active_upload_path = upload_path
+        _active_source = source
+        _source_generation += 1
+
+        async with _classifier_lock:
+            if _classifier is not None:
+                _classifier.reset()
+        async with _frame_lock:
+            global _latest_frame, _latest_detections
+            _latest_frame = None
+            _latest_detections = []
+
+        if old_upload_path and old_upload_path != upload_path:
+            old_upload_path.unlink(missing_ok=True)
+
+        log.info("Ingestion source switched to %s", source)
+
+
 # ──────────────────────────────────────────────
 # ──────────────────────────────────────────────
 # REST endpoints
@@ -358,13 +446,71 @@ async def health_check():
     """Health check and system status."""
     return {
         "status": "running",
-        "stream_source": STREAM_SOURCE,
+        "stream_source": _active_source,
         "resolution": f"{FRAME_WIDTH}x{FRAME_HEIGHT}",
         "fps": FRAME_FPS,
         "model": MODEL_PATH,
         "ws_clients": len(_ws_clients),
         "ingestion_alive": _ingest_process.is_alive() if _ingest_process else False,
     }
+
+
+@app.post("/source/webcam")
+async def use_webcam():
+    """Switch the active source to local webcam index zero."""
+    if _classifier is None:
+        raise HTTPException(status_code=503, detail="Ingestion is not initialized.")
+    try:
+        await _swap_ingestion_source("0", loop_file=False)
+    except Exception as exc:
+        log.exception("Could not switch ingestion to webcam.")
+        raise HTTPException(status_code=500, detail="Could not switch to webcam.") from exc
+    return {"status": "ok", "source": "webcam"}
+
+
+@app.post("/upload")
+async def upload_video(file: UploadFile = File(...)):
+    """Save an uploaded MP4 and switch ingestion to its real-time playback."""
+    if _classifier is None:
+        raise HTTPException(status_code=503, detail="Ingestion is not initialized.")
+    if Path(file.filename or "").suffix.lower() != ".mp4":
+        raise HTTPException(status_code=400, detail="Only .mp4 video files are supported.")
+
+    upload_dir = Path(tempfile.gettempdir()) / "violence-detection-uploads"
+    upload_path: Optional[Path] = None
+    try:
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".mp4", prefix="upload-", dir=upload_dir, delete=False
+        ) as temporary_file:
+            upload_path = Path(temporary_file.name)
+            total_bytes = 0
+            while chunk := await file.read(1024 * 1024):
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Video exceeds the {MAX_UPLOAD_BYTES}-byte upload limit.",
+                    )
+                temporary_file.write(chunk)
+
+        if total_bytes == 0:
+            raise HTTPException(status_code=400, detail="Uploaded video is empty.")
+
+        await _swap_ingestion_source(
+            str(upload_path), loop_file=False, upload_path=upload_path
+        )
+        upload_path = None
+        return {"status": "ok", "source": "upload"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("Could not save or start uploaded video.")
+        raise HTTPException(status_code=500, detail="Could not start uploaded video.") from exc
+    finally:
+        await file.close()
+        if upload_path:
+            upload_path.unlink(missing_ok=True)
 
 
 @app.get("/api/incidents")
@@ -404,7 +550,8 @@ async def websocket_stream(ws: WebSocket):
     Live video + incident stream via WebSocket.
     
     Messages sent to client:
-        {"type": "frame", "data": "<base64 JPEG>", "detections": N, "timestamp": T}
+        {"type": "frame", "data": "<base64 JPEG>", "detections": N,
+         "is_violence": bool, "timestamp": T}
         {"type": "incident", "data": {incident record}}
     """
     await ws.accept()

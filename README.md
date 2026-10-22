@@ -32,9 +32,9 @@ Modern action-recognition models (SlowFast, I3D, TimeSformer) demand high-end di
 This repository provides an end-to-end, edge-deployable violence detection system that replaces 200+ GFLOP 3D convolutions with:
 1. **Perception**: Single-pass 17-keypoint 2D human pose estimation via YOLOv8n-pose (~3.2 GFLOPs).
 2. **Temporal Reasoning**: A 15-frame rolling kinematic velocity heuristic with exponential moving average (EMA) smoothing ($\alpha = 0.4$) and proximity-aware severity escalation.
-3. **Robust Ingestion**: An isolated FFmpeg producer process coupled via a single-slot `multiprocessing.Queue(maxsize=1)` implementing an aggressive drop-old policy that prevents RTSP buffer lag and memory leaks.
+3. **Robust Ingestion**: An isolated FFmpeg producer process for RTSP and MP4, with native OpenCV webcam capture and a single-slot `multiprocessing.Queue(maxsize=1)` drop-old policy that prevents an unbounded frame backlog.
 4. **Dual-Sink Persistence**: Concurrent incident logging to SQLite in Write-Ahead Logging (WAL) mode and append-only JSON Lines (`incidents.jsonl`).
-5. **Real-Time Glassmorphism UI**: Next.js 15 dashboard streaming annotated video and incident alerts over WebSockets.
+5. **Real-Time Glassmorphism UI**: Next.js 16 dashboard streaming annotated video and incident alerts over WebSockets.
 
 ---
 
@@ -163,11 +163,11 @@ Ensure you have the following installed on your machine:
    STREAM_SOURCE="test_fight.mp4" python main.py
    ```
 
-The FastAPI application will start on `http://localhost:8000`.
+The FastAPI application will start on `http://localhost:7860`.
 
 ---
 
-### Step 2: Frontend Setup (Next.js 15 Dashboard)
+### Step 2: Frontend Setup (Next.js 16 Dashboard)
 
 1. Open a new terminal tab and navigate to the `frontend` directory:
    ```bash
@@ -189,7 +189,9 @@ The FastAPI application will start on `http://localhost:8000`.
    http://localhost:3000
    ```
 
-The dashboard will automatically connect to `ws://localhost:8000/ws/stream`, displaying the real-time annotated camera feed, frame rate, active keypoints, and incident log table.
+The dashboard will automatically connect to `ws://localhost:7860/ws/stream`, displaying the annotated camera feed, frame rate, and incident log.
+
+Use **Use Webcam** to switch to local camera index zero. Choose or drop an `.mp4` file with **Upload Video File** to replace the active source; uploaded clips play once at the configured frame rate. Uploads are limited to 500 MiB by default.
 
 ---
 
@@ -202,10 +204,11 @@ The dashboard will automatically connect to `ws://localhost:8000/ws/stream`, dis
 | `FRAME_HEIGHT` | `480` | Video frame downscale height in pixels |
 | `FRAME_FPS` | `15` | Target ingestion and inference frame rate |
 | `MODEL_PATH` | `"yolov8n-pose.pt"` | Ultralytics YOLOv8 pose model checkpoint |
+| `MAX_UPLOAD_BYTES` | `524288000` | Maximum uploaded MP4 size in bytes |
 | `JPEG_QUALITY` | `70` | Compression quality for WebSocket video frames (1–100) |
 | `LOG_LEVEL` | `"INFO"` | Standard Python logger level (`DEBUG`, `INFO`, `WARNING`) |
-| `NEXT_PUBLIC_WS_URL` | `ws://localhost:8000/ws/stream` | WebSocket streaming endpoint for Next.js |
-| `NEXT_PUBLIC_API_URL`| `http://localhost:8000` | REST API base URL for incident queries |
+| `NEXT_PUBLIC_WS_URL` | `ws://localhost:7860/ws/stream` | WebSocket streaming endpoint for Next.js |
+| `NEXT_PUBLIC_API_URL`| `http://localhost:7860` | REST API base URL for incident queries |
 
 ---
 
@@ -214,7 +217,9 @@ The dashboard will automatically connect to `ws://localhost:8000/ws/stream`, dis
 - `GET /`: Health check and system operational status.
 - `GET /api/incidents`: Query recent incident history from SQLite (`limit`, `min_severity`, `since_timestamp`).
 - `GET /api/stats`: Retrieve 24-hour incident volume and severity counts.
-- `WS /ws/stream`: Live bidirectional WebSocket broadcasting base64 JPEG frames and real-time JSON detection alerts.
+- `POST /source/webcam`: Switch ingestion to local webcam index zero.
+- `POST /upload`: Upload and play an MP4 file (multipart field: `file`).
+- `WS /ws/stream`: Broadcast base64 JPEG frames with `is_violence`, detection count, timestamp, and incident events.
 
 ---
 

@@ -3,38 +3,32 @@
 **Authors:** Engineering Research Team  
 **Affiliation:** Applied Systems & Vision Group  
 **Target:** Systems & Computer Vision Engineering Track  
-**Code & Data:** `backend/data/` (SQLite WAL + JSONL Logs)
+**Code & Data:** `backend/data/` (benchmark summary and JSONL incident log)
 
 ---
 
 ## Abstract
 
-Most CCTV networks in small businesses, transit hubs, and municipal sites run on legacy IP cameras outputting raw RTSP streams over 100Mbps Ethernet. Deploying modern 3D convolutional networks or video transformers (like SlowFast or TimeSformer) on these feeds requires expensive GPU clusters that these facilities simply can't afford. 
+This paper describes an edge-oriented violence-monitoring pipeline for existing cameras and uploaded video. It combines YOLOv8n-pose with a temporal velocity heuristic and accepts RTSP streams, a local webcam, or MP4 playback. A one-frame queue bounds ingestion backlog, and local files are paced to the configured frame rate so their motion is not evaluated as an artificial high-speed stream.
 
-We built a lightweight, edge-deployable violence detection pipeline that sidesteps temporal deep learning entirely. The system pairs single-shot 2D pose estimation (YOLOv8n-pose) with a zero-parameter temporal velocity heuristic running over a 15-frame sliding window. By tracking Euclidean displacement across wrist, elbow, and ankle joints, smoothing velocity spikes with an exponential moving average (alpha = 0.4), and applying proximity-weighted escalation logic, the pipeline reliably flags physical altercations without running 3D convolutions. 
-
-In our benchmark tests across 130 evaluated frames on an unaccelerated CPU, YOLOv8n-pose averaged 65.43 ms per frame (median 63.95 ms, p95 90.67 ms), while our velocity heuristic executed in just 0.095 ms. The full pipeline achieved 14.9 FPS sustained throughput with an average end-to-end latency of 66.95 ms (p95 74.31 ms). During stress tests simulating rapid strikes, close-quarter shoving, and post-incident cooldowns, the dual-sink logger captured 11 verified incidents (6 CRITICAL, 4 HIGH, 1 MEDIUM) with zero queue memory leaks thanks to an aggressive `multiprocessing.Queue(maxsize=1)` frame-dropping policy.
+The checked-in CPU benchmark summary reports 65.43 ms mean pose latency, 0.095 ms mean heuristic latency, 66.95 ms mean pipeline latency, and 14.9 frames per second across a 130-frame controlled run. Its JSONL incident log contains 11 records: six CRITICAL, four HIGH, and one MEDIUM. The harness constructs synthetic keypoint sequences for its motion scenarios; these figures measure implementation behavior under controlled inputs, not detection accuracy on independently labeled surveillance footage.
 
 ---
 
 ## 1. The Deployment Problem in Real Surveillance
 
-Computer vision papers love benchmarking on UCF-Crime, RWF-2000, and Kinetics-400 with racks of A100 GPUs. Out in the field, the reality looks completely different. 
+Many surveillance deployments already expose an RTSP stream, but a prototype or test setup may instead use a USB webcam or a short local clip. A useful monitoring service needs to handle each source without changing the inference interface. This implementation uses 2D pose estimation and frame-to-frame kinematics to keep the temporal stage small; the benchmark here measures runtime and logging behavior rather than comparative recognition accuracy.
 
-Over 80% of active commercial surveillance cameras run standard 1080p or 720p H.264 feeds over RTSP into aging Network Video Recorders. The operators running these sites (convenience store owners, school districts, rural transit platforms) don't have thousands of dollars for dedicated GPU edge servers. They have low-power x86 mini-PCs, Raspberry Pi units, or cheap quad-core gateway devices mounted inside dusty electrical closets.
-
-When you try running standard action recognition models on these machines, they choke:
-
-| Architecture | Model Parameters | GFLOPs (Clip) | Minimum Target GPU | Typical Frame Latency |
+| Architecture | Model Parameters | GFLOPs (Clip) | Indicative Compute Target | Reported Frame Latency |
 | :--- | :--- | :--- | :--- | :--- |
 | **SlowFast R-101** | 53.8M | 213.0 | RTX 2080 / T4 | ~120 ms |
 | **I3D (RGB + Flow)** | 25.0M | 108.0 | GTX 1080 Ti | ~95 ms |
 | **TimeSformer-L** | 121.4M | 196.0 | A100 / RTX 3090 | ~80 ms |
 | **Our System (YOLOv8n-pose + Heuristic)** | **3.2M** | **~3.3** | **None (Pure CPU)** | **66.95 ms** |
 
-3D-CNNs spend massive compute budgets learning spatial-temporal representations from dense pixel volumes. But violent physical altercations (punches, kicks, shoves, aggressive tackles) have a clear kinematic signature: rapid, non-periodic displacement of extremities occurring in tight physical proximity.
+The comparison values above are indicative figures drawn from prior reports, not measurements from a matched experiment. Only the final row is measured by the benchmark described in this paper.
 
-We decided to decouple perception from temporal classification. We let a fast, battle-tested 2D pose model find joint positions, and we handle the temporal classification with simple Newtonian kinematics.
+The method separates pose extraction from temporal classification. YOLOv8n-pose supplies joint coordinates; the classifier evaluates the movement of selected limbs over a short history and uses proximity as an escalation cue. This design is inexpensive to compute, but its limits are important: fast motion is only a proxy for violence and can produce false alarms.
 
 ---
 
@@ -44,8 +38,8 @@ The pipeline consists of three asynchronous stages designed around one core rule
 
 ```
 ┌─────────────────┐      raw bytes      ┌──────────────────────┐
-│ Legacy Camera   ├────────────────────►│ FFmpeg Subprocess    │
-│ (RTSP Stream)   │ (TCP Transport)     │ (-fflags nobuffer)   │
+│ RTSP / MP4      ├────────────────────►│ FFmpeg Subprocess    │
+│ Camera / Upload │                     │ (paced local files)  │
 └─────────────────┘                     └──────────┬───────────┘
                                                    │ Raw BGR
                                                    ▼
@@ -69,11 +63,11 @@ The pipeline consists of three asynchronous stages designed around one core rule
              └─────────────────────┘                               └─────────────────────┘
 ```
 
-### 2.1 RTSP Ingestion Without Memory Leaks
+### 2.1 Source-specific ingestion with a bounded queue
 
-Using OpenCV's `cv2.VideoCapture("rtsp://...")` in long-running production processes is a known trap. When an RTSP connection stutters or drops packets, OpenCV's internal FFmpeg demuxer either hangs indefinitely or leaks memory until the Linux OOM killer steps in.
+RTSP streams and MP4 files use an isolated producer process that reads FFmpeg raw frames. The local webcam uses OpenCV's `cv2.VideoCapture(0)` in that producer. A FastAPI upload endpoint stores MP4 input in a temporary file and replaces the active producer; a webcam endpoint can switch back to camera index zero. The consumer receives the same BGR frame format from every source.
 
-We isolate stream ingestion inside an independent Python `multiprocessing.Process`. This process launches an FFmpeg child worker that reads the stream directly using low-latency flags:
+For RTSP input, the producer launches FFmpeg with low-latency flags:
 
 ```bash
 ffmpeg -rtsp_transport tcp -i <STREAM_URL> \
@@ -84,9 +78,9 @@ ffmpeg -rtsp_transport tcp -i <STREAM_URL> \
        -f rawvideo pipe:1
 ```
 
-The worker reads exactly `640 * 480 * 3 = 921,600` bytes per frame from stdout. 
+The worker reads exactly `640 * 480 * 3 = 921,600` bytes per frame from stdout. For local video, FFmpeg converts frames to the configured resolution and rate. The producer sleeps for only the remaining portion of each target frame interval, keeping playback close to real time while compensating for time already spent reading and queueing the frame.
 
-Frames are pushed to a `multiprocessing.Queue(maxsize=1)`. If the main inference loop is busy and hasn't consumed the previous frame, the producer catches `queue.Full`, discards the oldest frame, and inserts the newest one. This drop-old policy guarantees constant memory usage regardless of how long the system runs. If the stream disconnects, the producer terminates FFmpeg, applies an exponential backoff (starting at 1 second, capped at 30 seconds), and spawns a fresh process.
+Frames are pushed to a `multiprocessing.Queue(maxsize=1)`. If inference is busy, the producer discards the stale frame and inserts the newest one rather than building an unbounded backlog. RTSP reconnection uses exponential backoff. Uploaded videos play once; the producer does not silently restart the clip at EOF.
 
 ---
 
@@ -138,11 +132,11 @@ We apply two critical heuristic constraints:
 
 ## 4. Real-World Benchmarks & Evaluation
 
-We evaluated the system on an unaccelerated CPU runtime (Intel/AMD x86_64 architecture, PyTorch 2.14.1+cpu) simulating a typical budget commercial NVR. 
+The checked-in benchmark summary identifies the test hardware only as a local x86_64 CPU machine with PyTorch CPU. The harness warms up YOLOv8n-pose, times 30 pose calls, and runs a separate 130-frame controlled kinematics sequence. It is not a field trial on recorded CCTV.
 
 ### 4.1 Latency Breakdown and Real Metrics
 
-We recorded exact latency metrics across 130 sequential test frames modeling diverse interaction phases: baseline walking, escalating gestures, close-quarter punching, sustained striking and kicking, and post-incident separation.
+The 130-frame sequence contains 20 baseline-motion frames, 25 moderate-motion frames, 30 simulated close-proximity punching frames, 35 simulated sustained-strike frames, and 20 cooldown frames. The script supplies synthetic keypoints directly to the temporal classifier; it does not ask YOLO to recognize a real fight in those phases.
 
 ```
 +-------------------------------------------------------------------------+
@@ -158,13 +152,13 @@ We recorded exact latency metrics across 130 sequential test frames modeling div
 +---------------------------------------------------+---------------------+
 ```
 
-The numbers tell an unambiguous story: the temporal velocity classifier adds virtually zero overhead (under 100 microseconds per frame). Nearly 98% of the compute budget is spent in YOLOv8n-pose's 2D feature extraction. 
+The benchmark shows that the temporal classifier is inexpensive relative to pose extraction: its reported mean is below one tenth of a millisecond. Pose estimation accounts for most measured inference time.
 
-At 66.95 ms per frame, the system sustains 14.9 FPS, fitting within the 15 FPS target standard for commercial surveillance video.
+The reported 14.9 FPS is close to the configured 15 FPS target on this test machine. It should not be taken as a throughput guarantee for other CPUs, camera resolutions, or deployment conditions.
 
 ### 4.2 Incident Log Analysis
 
-The table below summarizes the actual incident records captured by `IncidentLogger` and written to both `incidents.db` (SQLite WAL mode) and `incidents.jsonl`:
+The checked-in `incidents.jsonl` contains 11 records written by the controlled test harness. Their severity counts and velocity statistics are:
 
 | Severity Level | Event Count | Minimum Velocity (px/frame) | Mean Velocity (px/frame) | Peak Recorded Velocity (px/frame) | Primary Trigger Mode |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -172,17 +166,13 @@ The table below summarizes the actual incident records captured by `IncidentLogg
 | **HIGH** | 4 | 17.54 | 55.62 | 93.70 | Fast punches & lunges |
 | **MEDIUM** | 1 | 60.00 | 60.00 | 60.00 | Rapid arm extension |
 
-Notice the minimum recorded velocity for CRITICAL incidents is 8.38 px/frame. That looks counterintuitive until you examine the interaction logic: when two subjects remain locked in close contact (< 150 px center distance) over multiple consecutive frames, the proximity multiplier and consecutive counter escalate what would otherwise register as moderate motion into a CRITICAL altercation flag. This matches how real fights unfold, where periods of wrestling or grappling involve low limb speed but intense physical confrontation.
+The lowest velocity in the CRITICAL rows is 8.38 px/frame. This is possible because the classifier combines its smoothed movement score, consecutive-frame counter, and proximity escalation. It is a concrete example of the heuristic's behavior, not evidence that this threshold correctly identifies grappling in real footage. The log records classifier outputs; it contains no ground-truth labels or false-positive/false-negative counts.
 
-During the first 20 frames of normal walking motion, the system logged zero incidents. The consecutive frame filter (`min_trigger_frames = 3`) eliminated false alarms from natural arm swings.
+The harness defines the first 20 frames as baseline walking motion. This controlled check exercises the consecutive-frame filter, but does not replace evaluation on independently labeled videos.
 
 ### 4.3 Storage and Memory Footprint
 
-Surveillance boxes cannot afford disk bloat or memory creep. Over our test runs:
-- **Resident Set Size (RSS):** Stable at 492 MB.
-- **SQLite Database Overhead:** 16.0 KB with WAL journaling active.
-- **JSONL Append-Only Log:** 3.60 KB across all 11 recorded incidents.
-- **Bandwidth Consumption:** WebSocket streaming of annotated JPEG frames at 70% quality averaged 180 KB/s, well within local 100Mbps Ethernet budgets.
+The checked-in benchmark summary does not contain memory, database-size, or WebSocket-bandwidth measurements, so no values are reported for those metrics. The single-slot queue bounds queued frames; separate long-duration memory and network tests remain necessary before making deployment capacity claims.
 
 ---
 
@@ -198,9 +188,7 @@ We don't claim this approach solves violence detection under all circumstances. 
 
 ## 6. Conclusion
 
-You don't need heavyweight 3D convolutional networks or multi-gigabyte video transformers to detect physical violence on surveillance cameras. By combining a lightweight 2D pose model with simple Newtonian velocity tracking, exponential smoothing, and proximity boosting, we built a system that runs at 14.9 FPS on commodity CPU hardware with an average latency of 66.95 ms. 
-
-The complete codebase, SQLite incident store, and test suite are structured for direct retrofit onto existing RTSP infrastructure.
+This implementation combines a 2D pose model, short-window velocity smoothing, and proximity-based escalation, with RTSP, webcam, and paced MP4 input paths. The recorded benchmark reports 14.9 FPS and 66.95 ms mean pipeline latency on its local CPU test machine. Those runtime numbers do not establish detection accuracy: that requires evaluation on a representative, labeled video set, including non-violent fast movement, occlusion, camera motion, and varied lighting. The current logs provide a reproducible check of the classifier and logger under synthetic motion inputs, not a substitute for that study.
 
 ---
 

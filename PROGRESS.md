@@ -2,7 +2,7 @@
 
 > **Project**: Edge-Optimized Spatio-Temporal Violence Detection for Legacy Surveillance Infrastructure  
 > **Author**: L6 SWE / AI Researcher  
-> **Last Updated**: 2026-10-22T21:42:00+05:30
+> **Last Updated**: 2026-10-22T22:25:00+05:30
 
 ---
 
@@ -36,6 +36,22 @@
 
 - [x] `.gitignore` — Project-level gitignore
 - [x] `README.md` — Setup, usage, and deployment instructions
+- [x] `Dockerfile` — Hugging Face Spaces Docker image
+- [x] `requirements.txt` — Runtime dependencies, including multipart uploads
+- [x] `deploy.sh` / `deploy.py` — Hugging Face Spaces deployment helper; avoids auto-committing the worktree and excludes common secret files
+
+## Hybrid Input & Status Tagging
+
+- [x] `backend/ingest.py` — RTSP and MP4 via FFmpeg, webcam via `cv2.VideoCapture(0)`, and real-time pacing for local files
+- [x] `backend/main.py` — MP4 upload with size limit and temporary storage, hot-swappable ingestion, webcam source switch, and boolean `is_violence` WebSocket tag
+- [x] `frontend/src/app/page.tsx` — Webcam control, MP4 upload/drop, and dynamic SAFE/VIOLENCE feed badge
+- [x] `README.md` — Document input controls, upload limit, source endpoints, and WebSocket payload
+
+## Final Research & Deployment Phases
+
+- [x] `paper.md` and `paper/paper.md` — Updated from `benchmark_summary.json` and `incidents.jsonl`; distinguish controlled synthetic motion results from real-world accuracy claims
+- [x] Hugging Face packaging — Existing Dockerfile, requirements, and deployment helper confirmed present; frontend static export builds successfully
+- [x] Validation — Python syntax, backend route registration, Next.js production build, and `git diff --check`
 
 ---
 

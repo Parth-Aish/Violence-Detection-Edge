@@ -87,6 +87,15 @@ def deploy(space_name: str = "violence-detection", token: str = None, private: b
         "*.db-wal",
         "*.db-shm",
         "*.jsonl",
+        ".env",
+        ".env.*",
+        "**/.env",
+        "**/.env.*",
+        "*.pem",
+        "*.key",
+        "*.p12",
+        "*.pfx",
+        "**/secrets/**",
     ]
 
     try:

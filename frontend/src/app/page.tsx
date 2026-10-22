@@ -118,8 +118,14 @@ export default function DashboardPage() {
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
   const [fps, setFps] = useState(0);
   const [detectionCount, setDetectionCount] = useState(0);
+  const [isViolence, setIsViolence] = useState(false);
+  const [sourceMode, setSourceMode] = useState<"webcam" | "upload">("webcam");
+  const [sourceBusy, setSourceBusy] = useState(false);
+  const [sourceError, setSourceError] = useState<string | null>(null);
+  const [uploadedFilename, setUploadedFilename] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
   const frameCountRef = useRef(0);
   const fpsIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const reconnectRef = useRef<NodeJS.Timeout | null>(null);
@@ -171,6 +177,7 @@ export default function DashboardPage() {
         if (msg.type === "frame") {
           setFrameData(msg.data);
           setDetectionCount(msg.detections || 0);
+          setIsViolence(msg.is_violence === true);
           frameCountRef.current++;
         }
 
@@ -234,6 +241,58 @@ export default function DashboardPage() {
   const hasAlerts = incidents.some(
     (i) => i.severity_label === "CRITICAL" || i.severity_label === "HIGH"
   );
+
+  const useWebcam = async () => {
+    setSourceBusy(true);
+    setSourceError(null);
+    try {
+      const response = await fetch(`${getApiUrl()}/source/webcam`, { method: "POST" });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.detail || "Could not switch to webcam.");
+      }
+      setSourceMode("webcam");
+      setUploadedFilename(null);
+      setIsViolence(false);
+      setFrameData(null);
+    } catch (error) {
+      setSourceError(error instanceof Error ? error.message : "Could not switch to webcam.");
+    } finally {
+      setSourceBusy(false);
+    }
+  };
+
+  const uploadVideo = async (file?: File) => {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".mp4")) {
+      setSourceError("Choose an MP4 video file.");
+      return;
+    }
+
+    setSourceBusy(true);
+    setSourceError(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const response = await fetch(`${getApiUrl()}/upload`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.detail || "Could not upload video.");
+      }
+      setSourceMode("upload");
+      setUploadedFilename(file.name);
+      setIsViolence(false);
+      setFrameData(null);
+    } catch (error) {
+      setSourceError(error instanceof Error ? error.message : "Could not upload video.");
+    } finally {
+      setSourceBusy(false);
+      if (uploadInputRef.current) uploadInputRef.current.value = "";
+    }
+  };
 
   /* ════════════════════════════════════════════════════════
      Render
@@ -327,6 +386,68 @@ export default function DashboardPage() {
                   {new Date().toLocaleTimeString("en-US", { hour12: false })}
                 </span>
               </div>
+            )}
+
+            {frameData && (
+              <div
+                role={isViolence ? "alert" : "status"}
+                aria-live={isViolence ? "assertive" : "off"}
+                className={`absolute left-4 top-16 z-10 rounded-full border px-4 py-2 text-[11px] font-bold tracking-[0.12em] shadow-lg backdrop-blur-md ${
+                  isViolence
+                    ? "animate-pulse border-red-300 bg-red-600 text-white shadow-red-950/60"
+                    : "border-emerald-300/40 bg-emerald-950/80 text-emerald-300 shadow-emerald-950/40"
+                }`}
+              >
+                {isViolence ? "🚨 VIOLENCE DETECTED" : "SAFE: NO VIOLENCE"}
+              </div>
+            )}
+          </div>
+
+          {/* ════ Input Controls ════ */}
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-3 shadow-xl shadow-black/20 backdrop-blur-2xl">
+            <div className="flex min-w-0 flex-col">
+              <span className="text-xs font-semibold tracking-tight text-zinc-100">Video source</span>
+              <span className="max-w-full truncate text-[11px] text-zinc-500">
+                {sourceMode === "upload" && uploadedFilename ? uploadedFilename : "Choose a live camera or an MP4 file"}
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={useWebcam}
+                disabled={sourceBusy}
+                aria-pressed={sourceMode === "webcam"}
+                className={`rounded-xl border px-4 py-2 text-xs font-semibold transition disabled:cursor-wait disabled:opacity-50 ${
+                  sourceMode === "webcam"
+                    ? "border-white/20 bg-white text-zinc-950 shadow-md shadow-white/10"
+                    : "border-white/10 bg-white/[0.06] text-zinc-300 hover:bg-white/10"
+                }`}
+              >
+                {sourceBusy ? "Please wait..." : sourceMode === "webcam" ? "Using Webcam" : "Use Webcam"}
+              </button>
+              <input
+                ref={uploadInputRef}
+                type="file"
+                accept="video/mp4,.mp4"
+                className="hidden"
+                onChange={(event) => uploadVideo(event.target.files?.[0])}
+              />
+              <button
+                type="button"
+                onClick={() => uploadInputRef.current?.click()}
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  uploadVideo(event.dataTransfer.files[0]);
+                }}
+                disabled={sourceBusy}
+                className="rounded-xl border border-indigo-300/20 bg-indigo-500/15 px-4 py-2 text-xs font-semibold text-indigo-200 transition hover:border-indigo-200/40 hover:bg-indigo-500/25 disabled:cursor-wait disabled:opacity-50"
+              >
+                {sourceBusy ? "Working..." : "Upload Video File"}
+              </button>
+            </div>
+            {sourceError && (
+              <p role="alert" className="w-full text-[11px] text-red-300">{sourceError}</p>
             )}
           </div>
 
