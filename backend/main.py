@@ -97,6 +97,7 @@ _frame_lock = asyncio.Lock()
 # ──────────────────────────────────────────────
 async def _broadcast(message: dict):
     """Send JSON message to all connected WebSocket clients."""
+    global _ws_clients
     if not _ws_clients:
         return
     
@@ -104,13 +105,14 @@ async def _broadcast(message: dict):
     disconnected = set()
     
     async with _ws_lock:
-        for ws in _ws_clients:
+        for ws in set(_ws_clients):
             try:
                 await ws.send_text(payload)
             except Exception:
                 disconnected.add(ws)
         
-        _ws_clients -= disconnected
+        for ws in disconnected:
+            _ws_clients.discard(ws)
 
 
 def _annotate_frame(frame: np.ndarray, detections: list[DetectionResult]) -> np.ndarray:
@@ -172,63 +174,66 @@ async def _inference_loop():
     while True:
         try:
             # Pull frame from queue (run in executor to avoid blocking event loop)
-            frame = await loop.run_in_executor(
-                None, lambda: _frame_queue.get(timeout=2.0)
-            )
-        except Exception:
-            # Queue empty or timeout — no new frame
-            await asyncio.sleep(0.01)
-            continue
-        
-        frame_count += 1
-        
-        # Run inference in executor (CPU-bound)
-        detections = await loop.run_in_executor(
-            None, _classifier.process_frame, frame
-        )
-        
-        # Log incidents
-        if detections:
-            logged = await loop.run_in_executor(
-                None, _incident_logger.log_detections, detections
+            try:
+                frame = await loop.run_in_executor(
+                    None, lambda: _frame_queue.get(timeout=1.0)
+                )
+            except Exception:
+                await asyncio.sleep(0.01)
+                continue
+            
+            frame_count += 1
+            
+            # Run inference in executor (CPU-bound)
+            detections = await loop.run_in_executor(
+                None, _classifier.process_frame, frame
             )
             
-            # Broadcast detection events
-            for record in logged:
-                await _broadcast({
-                    "type": "incident",
-                    "data": record,
-                })
-        
-        # Annotate and encode frame
-        annotated = _annotate_frame(frame, detections)
-        jpeg_b64 = await loop.run_in_executor(
-            None, _frame_to_jpeg_base64, annotated
-        )
-        
-        # Update latest state
-        async with _frame_lock:
-            _latest_frame = annotated
-            _latest_detections = detections
-        
-        # Broadcast frame to WebSocket clients
-        await _broadcast({
-            "type": "frame",
-            "data": jpeg_b64,
-            "detections": len(detections),
-            "timestamp": time.time(),
-        })
-        
-        # FPS logging every 10 seconds
-        elapsed = time.time() - fps_start
-        if elapsed >= 10.0:
-            fps = frame_count / elapsed
-            log.info(f"Inference FPS: {fps:.1f}")
-            frame_count = 0
-            fps_start = time.time()
-        
-        # Yield to event loop
-        await asyncio.sleep(0.001)
+            # Log incidents
+            if detections:
+                logged = await loop.run_in_executor(
+                    None, _incident_logger.log_detections, detections
+                )
+                
+                # Broadcast detection events
+                for record in logged:
+                    await _broadcast({
+                        "type": "incident",
+                        "data": record,
+                    })
+            
+            # Annotate and encode frame
+            annotated = _annotate_frame(frame, detections)
+            jpeg_b64 = await loop.run_in_executor(
+                None, _frame_to_jpeg_base64, annotated
+            )
+            
+            # Update latest state
+            async with _frame_lock:
+                _latest_frame = annotated
+                _latest_detections = detections
+            
+            # Broadcast frame to WebSocket clients
+            await _broadcast({
+                "type": "frame",
+                "data": jpeg_b64,
+                "detections": len(detections),
+                "timestamp": time.time(),
+            })
+            
+            # FPS logging every 5 seconds
+            elapsed = time.time() - fps_start
+            if elapsed >= 5.0:
+                fps = frame_count / elapsed
+                log.info(f"Inference FPS: {fps:.1f} (clients: {len(_ws_clients)})")
+                frame_count = 0
+                fps_start = time.time()
+            
+            # Yield to event loop
+            await asyncio.sleep(0.001)
+        except Exception as e:
+            log.error(f"Error in inference loop: {e}", exc_info=True)
+            await asyncio.sleep(0.05)
 
 
 # ──────────────────────────────────────────────

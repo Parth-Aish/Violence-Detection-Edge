@@ -214,13 +214,17 @@ class FrameProducer:
                 frame = cv2.resize(frame, (self.config.width, self.config.height))
 
             try:
+                self.frame_queue.put_nowait(frame)
+            except Exception:
+                # Queue is full — discard stale frame and insert newest
                 try:
                     self.frame_queue.get_nowait()
                 except Exception:
                     pass
-                self.frame_queue.put_nowait(frame)
-            except Exception:
-                pass
+                try:
+                    self.frame_queue.put_nowait(frame)
+                except Exception:
+                    pass
 
             next_frame_time += frame_interval
             sleep_dur = next_frame_time - time.perf_counter()
@@ -299,13 +303,17 @@ class FrameProducer:
                 # If queue is full, discard the stale frame and push the latest one.
                 # Guarantees the inference engine always processes the freshest frame.
                 try:
+                    self.frame_queue.put_nowait(frame)
+                except Exception:
+                    # Queue is full — discard stale frame and insert newest
                     try:
                         self.frame_queue.get_nowait()
                     except Exception:
                         pass
-                    self.frame_queue.put_nowait(frame)
-                except Exception:
-                    pass
+                    try:
+                        self.frame_queue.put_nowait(frame)
+                    except Exception:
+                        pass
 
                 frames_read += 1
                 if frames_read % (self.config.fps * 60) == 0:
