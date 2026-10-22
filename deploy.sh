@@ -20,15 +20,20 @@ echo "================================================================="
 echo "  Deploying Violence Detection System to Hugging Face Spaces"
 echo "================================================================="
 
-# 1. Check Python installation
-if ! command -v python3 &>/dev/null && ! command -v python &>/dev/null; then
-    echo "[ERROR] Python is not found on PATH. Please install Python 3.10+."
-    exit 1
-fi
+# 1. Resolve Python binary (support Windows Git Bash/WSL and native Linux/macOS)
+PYTHON_BIN=""
+for cmd in python.exe python3 python; do
+    if command -v "$cmd" &>/dev/null; then
+        if "$cmd" -c "import sys" &>/dev/null; then
+            PYTHON_BIN="$cmd"
+            break
+        fi
+    fi
+done
 
-PYTHON_BIN="python3"
-if ! command -v python3 &>/dev/null; then
-    PYTHON_BIN="python"
+if [ -z "$PYTHON_BIN" ]; then
+    echo "[ERROR] Python 3.10+ is required but not found on PATH."
+    exit 1
 fi
 
 # 2. Check and install huggingface_hub if missing
