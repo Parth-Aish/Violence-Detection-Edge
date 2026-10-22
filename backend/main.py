@@ -37,6 +37,7 @@ import signal
 import sys
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -44,6 +45,7 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from ingest import create_ingestion_pipeline, StreamConfig
 from inference import TemporalVelocityClassifier, DetectionResult, Severity
@@ -264,11 +266,17 @@ async def lifespan(app: FastAPI):
     _incident_logger = IncidentLogger(cooldown_seconds=2.0)
     
     # Start ingestion process
-    # Handle webcam index (string "0" → integer 0 for OpenCV fallback)
     source = STREAM_SOURCE
     if source.isdigit():
-        # For webcam, we use OpenCV-based capture in the inference loop
-        log.info(f"Using webcam index: {source}")
+        demo_path = Path(__file__).parent / "demo_sample.mp4"
+        if not sys.platform.startswith("win") and not os.path.exists(f"/dev/video{source}") and demo_path.exists():
+            log.info(f"No webcam /dev/video{source} detected on Linux/Docker. Falling back to demo video: {demo_path}")
+            source = str(demo_path)
+        elif os.getenv("USE_DEMO_STREAM", "0") == "1" and demo_path.exists():
+            log.info(f"Using demo stream: {demo_path}")
+            source = str(demo_path)
+        else:
+            log.info(f"Using webcam index: {source}")
     
     _ingest_process, _frame_queue, _shutdown_event = create_ingestion_pipeline(
         source=source,
@@ -337,9 +345,10 @@ app.add_middleware(
 
 
 # ──────────────────────────────────────────────
+# ──────────────────────────────────────────────
 # REST endpoints
 # ──────────────────────────────────────────────
-@app.get("/")
+@app.get("/api/health")
 async def health_check():
     """Health check and system status."""
     return {
@@ -419,6 +428,31 @@ async def websocket_stream(ws: WebSocket):
 
 
 # ──────────────────────────────────────────────
+# Static Frontend Mount (Next.js export)
+# ──────────────────────────────────────────────
+_frontend_candidates = [
+    Path(__file__).parent.parent / "frontend" / "out",
+    Path(__file__).parent / "static",
+    Path("/app/frontend/out"),
+    Path("/app/static"),
+]
+_frontend_dir = next((p for p in _frontend_candidates if p.exists() and p.is_dir()), None)
+
+if _frontend_dir:
+    log.info(f"Mounting static Next.js frontend export from: {_frontend_dir}")
+    app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")
+else:
+    @app.get("/")
+    async def root_fallback():
+        return {
+            "status": "running",
+            "service": "Violence Detection System",
+            "stream_source": STREAM_SOURCE,
+            "clients": len(_ws_clients),
+        }
+
+
+# ──────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
@@ -427,10 +461,11 @@ if __name__ == "__main__":
     # Ensure multiprocessing works on Windows
     multiprocessing.freeze_support()
     
+    port = int(os.getenv("PORT", "7860"))
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
+        port=port,
         reload=False,
         log_level=LOG_LEVEL.lower(),
         ws_ping_interval=30,

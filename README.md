@@ -1,3 +1,14 @@
+---
+title: Violence Detection System
+emoji: 🚨
+colorFrom: red
+colorTo: gray
+sdk: docker
+app_port: 7860
+pinned: false
+license: mit
+---
+
 # Edge-Optimized Violence Detection System
 
 <p align="center">

@@ -36,8 +36,23 @@ type ConnectionStatus = "connecting" | "connected" | "disconnected";
    Constants
    ════════════════════════════════════════════════════════════ */
 
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000/ws/stream";
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+function getWsUrl(): string {
+  if (process.env.NEXT_PUBLIC_WS_URL) return process.env.NEXT_PUBLIC_WS_URL;
+  if (typeof window !== "undefined") {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${window.location.host}/ws/stream`;
+  }
+  return "ws://localhost:8000/ws/stream";
+}
+
+function getApiUrl(): string {
+  if (process.env.NEXT_PUBLIC_API_URL) return process.env.NEXT_PUBLIC_API_URL;
+  if (typeof window !== "undefined") {
+    return window.location.origin;
+  }
+  return "http://localhost:8000";
+}
+
 const MAX_INCIDENTS = 100;
 const RECONNECT_DELAY = 3000;
 
@@ -105,7 +120,7 @@ export default function DashboardPage() {
   /* ── Fetch initial incidents via REST ── */
   const fetchIncidents = useCallback(async () => {
     try {
-      const res = await fetch(`${API_URL}/api/incidents?limit=50&min_severity=1`);
+      const res = await fetch(`${getApiUrl()}/api/incidents?limit=50&min_severity=1`);
       if (res.ok) {
         const data = await res.json();
         setIncidents(data.incidents || []);
@@ -118,7 +133,7 @@ export default function DashboardPage() {
   /* ── Fetch stats ── */
   const fetchStats = useCallback(async () => {
     try {
-      const res = await fetch(`${API_URL}/api/stats?hours=24`);
+      const res = await fetch(`${getApiUrl()}/api/stats?hours=24`);
       if (res.ok) {
         const data = await res.json();
         setStats(data);
@@ -133,7 +148,7 @@ export default function DashboardPage() {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
     setStatus("connecting");
-    const ws = new WebSocket(WS_URL);
+    const ws = new WebSocket(getWsUrl());
     wsRef.current = ws;
 
     ws.onopen = () => {

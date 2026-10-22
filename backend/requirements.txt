@@ -1,15 +1,16 @@
 # Violence Detection System — Python Dependencies
-# Tested on Python 3.10+
+# Hugging Face Spaces & Local Deployment
 
-# === Core Framework ===
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-websockets==14.2
+# Core Web & API Framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+websockets>=13.0
+python-multipart>=0.0.18
 
-# === ML / Computer Vision ===
-ultralytics==8.3.52        # YOLOv8-Pose
-opencv-python-headless==4.10.0.84
+# Machine Learning & Computer Vision
+ultralytics>=8.3.0
+opencv-python-headless>=4.10.0.84
 numpy>=1.26.0,<2.0.0
 
-# === Utilities ===
-python-multipart==0.0.20
+# Deployment & Hugging Face Hub CLI
+huggingface_hub>=0.28.0
