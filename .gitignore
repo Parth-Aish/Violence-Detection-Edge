@@ -1,0 +1,47 @@
+# ═══════════════════════════════════════
+# Violence Detection System — .gitignore
+# ═══════════════════════════════════════
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# YOLOv8 model weights
+*.pt
+*.onnx
+*.engine
+runs/
+
+# Data (generated at runtime)
+backend/data/*.db
+backend/data/*.jsonl
+backend/data/*.db-wal
+backend/data/*.db-shm
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log

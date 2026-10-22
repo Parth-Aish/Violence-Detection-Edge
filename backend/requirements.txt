@@ -1,0 +1,15 @@
+# Violence Detection System — Python Dependencies
+# Tested on Python 3.10+
+
+# === Core Framework ===
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+websockets==14.2
+
+# === ML / Computer Vision ===
+ultralytics==8.3.52        # YOLOv8-Pose
+opencv-python-headless==4.10.0.84
+numpy>=1.26.0,<2.0.0
+
+# === Utilities ===
+python-multipart==0.0.20
