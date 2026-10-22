@@ -71,9 +71,9 @@ class FrameProducer:
         self.config = config
         self.frame_queue = frame_queue
         self.shutdown_event = shutdown_event
-        self._process: Optional[subprocess.Popen] = None
         self._frame_size = config.width * config.height * 3  # BGR24 = 3 bytes/pixel
         self._is_local = self._detect_local_file(config.source)
+        self._is_webcam = config.source.isdigit()
 
     @staticmethod
     def _detect_local_file(source: str) -> bool:
@@ -189,23 +189,71 @@ class FrameProducer:
         )
         return frame
 
+    def _run_webcam_capture(self):
+        """Native OpenCV capture loop for local webcams (0, 1, etc.)."""
+        import cv2
+        device_id = int(self.config.source)
+        logger.info(f"FrameProducer starting native OpenCV capture for webcam index {device_id}")
+        cap = cv2.VideoCapture(device_id)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
+        cap.set(cv2.CAP_PROP_FPS, self.config.fps)
+
+        frame_interval = 1.0 / max(1, self.config.fps)
+        next_frame_time = time.perf_counter()
+
+        while not self.shutdown_event.is_set():
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                logger.warning(f"Failed to read from webcam {device_id}. Retrying...")
+                if self.shutdown_event.wait(timeout=1.0):
+                    break
+                continue
+
+            if frame.shape[1] != self.config.width or frame.shape[0] != self.config.height:
+                frame = cv2.resize(frame, (self.config.width, self.config.height))
+
+            try:
+                try:
+                    self.frame_queue.get_nowait()
+                except Exception:
+                    pass
+                self.frame_queue.put_nowait(frame)
+            except Exception:
+                pass
+
+            next_frame_time += frame_interval
+            sleep_dur = next_frame_time - time.perf_counter()
+            if sleep_dur > 0:
+                if self.shutdown_event.wait(timeout=sleep_dur):
+                    break
+            elif sleep_dur < -0.2:
+                next_frame_time = time.perf_counter()
+
+        cap.release()
+        logger.info(f"Webcam {device_id} released cleanly.")
+
     def run(self):
         """
         Main producer loop. Designed to be called as the target of
         multiprocessing.Process.
 
         Pattern:
-            1. Spawn FFmpeg.
-            2. Read frame from pipe.
+            1. If webcam: run native OpenCV capture loop.
+            2. If RTSP or local video: spawn FFmpeg subprocess.
             3. Push to Queue(maxsize=1) with drop-old policy.
             4. If local file: enforce high-precision sleep timer simulating 1x real-time playback.
             5. On failure or EOF: cleanup and restart/reconnect if required.
         """
-        backoff = self.config.reconnect_delay_init
-        consecutive_failures = 0
-
         # Ignore SIGINT in child process — parent handles orchestration
         signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+        if self._is_webcam:
+            self._run_webcam_capture()
+            return
+
+        backoff = self.config.reconnect_delay_init
+        consecutive_failures = 0
 
         source_type = "Local File" if self._is_local else "RTSP Stream"
         logger.info(

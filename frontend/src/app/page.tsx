@@ -39,18 +39,26 @@ type ConnectionStatus = "connecting" | "connected" | "disconnected";
 function getWsUrl(): string {
   if (process.env.NEXT_PUBLIC_WS_URL) return process.env.NEXT_PUBLIC_WS_URL;
   if (typeof window !== "undefined") {
+    // If browsing through Next.js dev server (port 3000), connect to backend port 7860
+    if (window.location.port === "3000") {
+      return `ws://${window.location.hostname}:7860/ws/stream`;
+    }
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     return `${proto}//${window.location.host}/ws/stream`;
   }
-  return "ws://localhost:8000/ws/stream";
+  return "ws://localhost:7860/ws/stream";
 }
 
 function getApiUrl(): string {
   if (process.env.NEXT_PUBLIC_API_URL) return process.env.NEXT_PUBLIC_API_URL;
   if (typeof window !== "undefined") {
+    // If browsing through Next.js dev server (port 3000), connect to backend port 7860
+    if (window.location.port === "3000") {
+      return `${window.location.protocol}//${window.location.hostname}:7860`;
+    }
     return window.location.origin;
   }
-  return "http://localhost:8000";
+  return "http://localhost:7860";
 }
 
 const MAX_INCIDENTS = 100;
