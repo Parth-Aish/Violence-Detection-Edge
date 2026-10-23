@@ -16,8 +16,16 @@ env/
 # YOLOv8 model weights
 *.pt
 *.onnx
+!backend/violence_lstm.onnx
 *.engine
 runs/
+
+# Training artifacts and dataset downloads
+/data/raw/
+/data/processed/
+*.npy
+kaggle.json
+**/kaggle.json
 
 # Data (generated at runtime)
 backend/data/*.db

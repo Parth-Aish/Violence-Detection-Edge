@@ -87,6 +87,14 @@ def deploy(space_name: str = "violence-detection", token: str = None, private: b
         "*.db-wal",
         "*.db-shm",
         "*.jsonl",
+        "data/raw/**",
+        "data/processed/**",
+        "**/data/raw/**",
+        "**/data/processed/**",
+        "*.npy",
+        "*.pt",
+        "kaggle.json",
+        "**/kaggle.json",
         ".env",
         ".env.*",
         "**/.env",
@@ -121,9 +129,16 @@ def deploy(space_name: str = "violence-detection", token: str = None, private: b
         # Git fallback
         remote_url = f"https://huggingface.co/spaces/{repo_id}"
         try:
-            subprocess.run(["git", "remote", "remove", "space"], capture_output=True)
-            subprocess.run(["git", "remote", "add", "space", remote_url], check=True)
-            subprocess.run(["git", "push", "space", "master:main", "--force"], check=True)
+            remotes = subprocess.run(
+                ["git", "remote"], check=True, capture_output=True, text=True
+            ).stdout.splitlines()
+            if "space" in remotes:
+                subprocess.run(
+                    ["git", "remote", "set-url", "space", remote_url], check=True
+                )
+            else:
+                subprocess.run(["git", "remote", "add", "space", remote_url], check=True)
+            subprocess.run(["git", "push", "space", "HEAD:main"], check=True)
             print(f"[GIT PUSH] Pushed successfully to {remote_url}")
         except Exception as git_err:
             print(f"[GIT ERROR] Git fallback failed: {git_err}")

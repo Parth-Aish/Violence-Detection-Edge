@@ -1,31 +1,6 @@
-"""
-main.py — FastAPI Server: Process Orchestration + WebSocket Streaming
-======================================================================
+"""FastAPI application coordinating hybrid video ingestion and ONNX inference."""
 
-Architecture:
-    ┌─────────────┐    Queue(1)    ┌──────────────┐    WS /ws/stream
-    │ FrameProducer├──────────────►│ InferenceLoop ├──────────────────► Clients
-    │ (subprocess) │               │ (async task)  │    (JPEG + JSON)
-    └─────────────┘               └───────┬───────┘
-                                          │
-                                  ┌───────▼───────┐
-                                  │ IncidentLogger │
-                                  │ (SQLite+JSONL) │
-                                  └───────────────┘
-
-Endpoints:
-    GET  /                         → Health check
-    GET  /api/incidents            → Recent incidents (JSON)
-    GET  /api/stats                → Incident count stats
-    WS   /ws/stream                → Live annotated video + detection events
-
-Process Management:
-    - FastAPI lifespan manages the ingestion process lifecycle
-    - Inference runs in an asyncio background task (not a process)
-    - WebSocket broadcasts to all connected clients
-
-Author: Violence Detection System
-"""
+from __future__ import annotations
 
 import asyncio
 import base64
@@ -34,333 +9,282 @@ import logging
 import multiprocessing
 import os
 import tempfile
-import signal
-import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from queue import Empty
 from typing import Optional
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
-from ingest import create_ingestion_pipeline, StreamConfig
-from inference import TemporalVelocityClassifier, DetectionResult, Severity
+from inference import PoseLSTMDetector, Severity, ViolencePrediction
+from ingest import create_ingestion_pipeline
 from logger import IncidentLogger
 
-# ──────────────────────────────────────────────
-# Configuration via environment variables
-# ──────────────────────────────────────────────
-STREAM_SOURCE = os.getenv("STREAM_SOURCE", "0")  # RTSP URL, file path, or "0" for webcam
+
+STREAM_SOURCE = os.getenv("STREAM_SOURCE", "0")
 FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "640"))
 FRAME_HEIGHT = int(os.getenv("FRAME_HEIGHT", "480"))
-FRAME_FPS = int(os.getenv("FRAME_FPS", "15"))
-MODEL_PATH = os.getenv("MODEL_PATH", "yolov8n-pose.pt")
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "70"))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+FRAME_FPS = int(os.getenv("FRAME_FPS", "30"))
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "75"))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(500 * 1024 * 1024)))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# ──────────────────────────────────────────────
-# Logging setup
-# ──────────────────────────────────────────────
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("main")
 
-# ──────────────────────────────────────────────
-# Global state
-# ──────────────────────────────────────────────
-_frame_queue: Optional[multiprocessing.Queue] = None
+FrameQueue = multiprocessing.Queue
+_frame_queue: Optional[FrameQueue] = None
 _shutdown_event: Optional[multiprocessing.Event] = None
 _ingest_process: Optional[multiprocessing.Process] = None
-_classifier: Optional[TemporalVelocityClassifier] = None
+_classifier: Optional[PoseLSTMDetector] = None
 _incident_logger: Optional[IncidentLogger] = None
 _inference_task: Optional[asyncio.Task] = None
 _active_upload_path: Optional[Path] = None
-_active_source = STREAM_SOURCE
+_active_source_type = "webcam"
 _source_generation = 0
+
+_ws_clients: set[WebSocket] = set()
+_ws_lock = asyncio.Lock()
 _source_lock = asyncio.Lock()
 _classifier_lock = asyncio.Lock()
 
-# WebSocket client registry
-_ws_clients: set[WebSocket] = set()
-_ws_lock = asyncio.Lock()
 
-# Latest frame for WebSocket broadcast
-_latest_frame: Optional[np.ndarray] = None
-_latest_detections: list[DetectionResult] = []
-_frame_lock = asyncio.Lock()
+class RTSPSourceRequest(BaseModel):
+    source: str = Field(min_length=8, max_length=2048)
 
 
-# ──────────────────────────────────────────────
-# WebSocket broadcast helpers
-# ──────────────────────────────────────────────
-async def _broadcast(message: dict):
-    """Send JSON message to all connected WebSocket clients."""
-    global _ws_clients
+def _source_type(source: str, uploaded: bool = False) -> str:
+    if uploaded:
+        return "upload"
+    if source.isdigit():
+        return "webcam"
+    return "rtsp" if source.lower().startswith(("rtsp://", "rtsps://")) else "file"
+
+
+def _stop_ingestion(
+    process: Optional[multiprocessing.Process],
+    stop_event: Optional[multiprocessing.Event],
+) -> None:
+    if stop_event is not None:
+        stop_event.set()
+    if process is not None and process.is_alive():
+        process.join(timeout=8)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=4)
+        if process.is_alive():
+            raise RuntimeError("Ingestion process did not stop.")
+
+
+async def _swap_source(
+    source: str,
+    *,
+    loop_file: bool = False,
+    upload_path: Optional[Path] = None,
+) -> None:
+    global _frame_queue, _shutdown_event, _ingest_process
+    global _active_upload_path, _active_source_type, _source_generation
+
+    async with _source_lock:
+        process, frame_queue, stop_event = create_ingestion_pipeline(
+            source=source,
+            width=FRAME_WIDTH,
+            height=FRAME_HEIGHT,
+            fps=FRAME_FPS,
+            loop_file=loop_file,
+            simulate_realtime=True,
+        )
+        process.start()
+
+        old_process, old_stop_event = _ingest_process, _shutdown_event
+        old_upload_path = _active_upload_path
+        try:
+            _stop_ingestion(old_process, old_stop_event)
+        except Exception:
+            _stop_ingestion(process, stop_event)
+            raise
+
+        _ingest_process = process
+        _frame_queue = frame_queue
+        _shutdown_event = stop_event
+        _active_upload_path = upload_path
+        _active_source_type = _source_type(source, uploaded=upload_path is not None)
+        _source_generation += 1
+
+        async with _classifier_lock:
+            if _classifier is not None:
+                _classifier.reset()
+        if old_upload_path is not None and old_upload_path != upload_path:
+            old_upload_path.unlink(missing_ok=True)
+        log.info("Video source changed to %s", _active_source_type)
+
+
+async def _broadcast(payload: dict) -> None:
     if not _ws_clients:
         return
-    
-    payload = json.dumps(message)
-    disconnected = set()
-    
+    encoded = json.dumps(payload)
     async with _ws_lock:
-        for ws in set(_ws_clients):
+        for websocket in tuple(_ws_clients):
             try:
-                await ws.send_text(payload)
-            except Exception:
-                disconnected.add(ws)
-        
-        for ws in disconnected:
-            _ws_clients.discard(ws)
+                await websocket.send_text(encoded)
+            except (WebSocketDisconnect, RuntimeError, OSError):
+                _ws_clients.discard(websocket)
 
 
-def _annotate_frame(frame: np.ndarray, detections: list[DetectionResult]) -> np.ndarray:
-    """
-    Draw bounding boxes and severity labels on the frame.
-    Color-coded by severity: GREEN(LOW), YELLOW(MED), ORANGE(HIGH), RED(CRIT).
-    """
+def _annotate_frame(frame: np.ndarray, prediction: ViolencePrediction) -> np.ndarray:
     annotated = frame.copy()
-    
-    severity_colors = {
-        Severity.LOW: (0, 200, 100),       # Green
-        Severity.MEDIUM: (0, 220, 255),     # Yellow
-        Severity.HIGH: (0, 140, 255),       # Orange
-        Severity.CRITICAL: (0, 0, 255),     # Red
-    }
-    
-    for det in detections:
-        x1, y1, x2, y2 = map(int, det.bbox)
-        color = severity_colors.get(det.severity, (255, 255, 255))
-        
-        # Bounding box
+    if prediction.bbox is not None:
+        x1, y1, x2, y2 = (int(value) for value in prediction.bbox)
+        color = (0, 0, 255) if prediction.is_fighting else (40, 180, 90)
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        
-        # Label background
-        label = f"{det.severity.name} | {det.max_velocity:.0f}px/f"
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(annotated, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(annotated, label, (x1 + 2, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-    
+        label = f"{prediction.severity.name} {prediction.probability:.2f}"
+        cv2.putText(
+            annotated,
+            label,
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
     return annotated
 
 
-def _frame_to_jpeg_base64(frame: np.ndarray) -> str:
-    """Encode frame to JPEG and return as base64 string."""
-    _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    return base64.b64encode(buffer).decode("utf-8")
+def _jpeg_base64(frame: np.ndarray) -> str:
+    success, buffer = cv2.imencode(
+        ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+    )
+    if not success:
+        raise RuntimeError("OpenCV failed to encode a WebSocket frame.")
+    return base64.b64encode(buffer).decode("ascii")
 
 
-# ──────────────────────────────────────────────
-# Inference loop (runs as asyncio background task)
-# ──────────────────────────────────────────────
-async def _inference_loop():
-    """
-    Main inference loop:
-        1. Pull latest frame from Queue (non-blocking)
-        2. Run YOLOv8-Pose + temporal classifier
-        3. Log incidents
-        4. Broadcast annotated frame + detections via WebSocket
-    """
-    global _latest_frame, _latest_detections
-    
-    log.info("Inference loop started.")
-    
-    loop = asyncio.get_event_loop()
+async def _inference_loop() -> None:
+    global _frame_queue
+    loop = asyncio.get_running_loop()
     frame_count = 0
-    fps_start = time.time()
-    
+    rate_started = time.monotonic()
+    measured_fps = 0.0
+
     while True:
+        frame_queue = _frame_queue
+        generation = _source_generation
+        if frame_queue is None:
+            await asyncio.sleep(0.05)
+            continue
+
         try:
-            frame_queue = _frame_queue
-            source_generation = _source_generation
-            if frame_queue is None:
-                await asyncio.sleep(0.05)
-                continue
+            frame = await loop.run_in_executor(
+                None, lambda: frame_queue.get(timeout=1.0)
+            )
+        except Empty:
+            await asyncio.sleep(0.01)
+            continue
+        if generation != _source_generation:
+            continue
 
-            # Pull frame from queue (run in executor to avoid blocking event loop)
-            try:
-                frame = await loop.run_in_executor(
-                    None, lambda: frame_queue.get(timeout=1.0)
-                )
-            except Exception:
-                await asyncio.sleep(0.01)
-                continue
-
-            if source_generation != _source_generation:
-                continue
-            
-            frame_count += 1
-            
-            # Run inference in executor (CPU-bound)
+        try:
             async with _classifier_lock:
-                if source_generation != _source_generation:
+                if generation != _source_generation or _classifier is None:
                     continue
-                detections = await loop.run_in_executor(
+                prediction = await loop.run_in_executor(
                     None, _classifier.process_frame, frame
                 )
-
-            if source_generation != _source_generation:
+            if generation != _source_generation:
                 continue
 
-            # Log incidents
-            if detections:
-                logged = await loop.run_in_executor(
-                    None, _incident_logger.log_detections, detections
-                )
-                
-                # Broadcast detection events
-                for record in logged:
-                    await _broadcast({
-                        "type": "incident",
-                        "data": record,
-                    })
-            
-            # Annotate and encode frame
-            annotated = _annotate_frame(frame, detections)
-            jpeg_b64 = await loop.run_in_executor(
-                None, _frame_to_jpeg_base64, annotated
-            )
-            
-            # Update latest state
-            async with _frame_lock:
-                _latest_frame = annotated
-                _latest_detections = detections
-            
-            # Broadcast frame to WebSocket clients
-            await _broadcast({
-                "type": "frame",
-                "data": jpeg_b64,
-                "detections": len(detections),
-                "is_violence": bool(detections),
-                "timestamp": time.time(),
-            })
-            
-            # FPS logging every 5 seconds
-            elapsed = time.time() - fps_start
-            if elapsed >= 5.0:
-                fps = frame_count / elapsed
-                log.info(f"Inference FPS: {fps:.1f} (clients: {len(_ws_clients)})")
+            frame_count += 1
+            elapsed = time.monotonic() - rate_started
+            if elapsed >= 1.0:
+                measured_fps = frame_count / elapsed
                 frame_count = 0
-                fps_start = time.time()
-            
-            # Yield to event loop
-            await asyncio.sleep(0.001)
-        except Exception as e:
-            log.error(f"Error in inference loop: {e}", exc_info=True)
+                rate_started = time.monotonic()
+
+            record = await loop.run_in_executor(
+                None, _incident_logger.log_prediction, prediction
+            )
+            if record:
+                await _broadcast({"type": "incident", "data": record})
+
+            annotated = _annotate_frame(frame, prediction)
+            await _broadcast(
+                {
+                    "type": "frame",
+                    "data": _jpeg_base64(annotated),
+                    "is_violence": prediction.is_fighting,
+                    "probability": prediction.probability,
+                    "severity": prediction.severity.name,
+                    "fps": measured_fps or prediction.fps,
+                    "inference_ms": prediction.inference_ms,
+                    "timestamp": prediction.timestamp,
+                }
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Frame inference or broadcast failed.")
             await asyncio.sleep(0.05)
 
 
-# ──────────────────────────────────────────────
-# FastAPI lifespan
-# ──────────────────────────────────────────────
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Manages the lifecycle of:
-        1. Frame ingestion process (multiprocessing)
-        2. Inference classifier
-        3. Incident logger
-        4. Background inference task
-    """
-    global _frame_queue, _shutdown_event, _ingest_process, _active_source
+async def lifespan(_: FastAPI):
     global _classifier, _incident_logger, _inference_task
-    
-    log.info("=" * 60)
-    log.info("Violence Detection System — Starting")
-    log.info(f"Stream source: {STREAM_SOURCE}")
-    log.info(f"Resolution: {FRAME_WIDTH}x{FRAME_HEIGHT} @ {FRAME_FPS}fps")
-    log.info(f"Model: {MODEL_PATH}")
-    log.info("=" * 60)
-    
-    # Initialize classifier
-    _classifier = TemporalVelocityClassifier(
-        window_size=15,
-        fps=FRAME_FPS,
-        frame_width=FRAME_WIDTH,
-        frame_height=FRAME_HEIGHT,
-        model_path=MODEL_PATH,
-    )
-    
-    # Initialize logger
-    _incident_logger = IncidentLogger(cooldown_seconds=2.0)
-    
-    # Start ingestion process
-    source = STREAM_SOURCE
-    if source.isdigit():
-        demo_path = Path(__file__).parent / "demo_sample.mp4"
-        if not sys.platform.startswith("win") and not os.path.exists(f"/dev/video{source}") and demo_path.exists():
-            log.info(f"No webcam /dev/video{source} detected on Linux/Docker. Falling back to demo video: {demo_path}")
-            source = str(demo_path)
-        elif os.getenv("USE_DEMO_STREAM", "0") == "1" and demo_path.exists():
-            log.info(f"Using demo stream: {demo_path}")
-            source = str(demo_path)
-        else:
-            log.info(f"Using webcam index: {source}")
+    global _frame_queue, _shutdown_event, _ingest_process
+    global _active_source_type
 
-    _active_source = source
-    
+    log.info("Starting pose-LSTM violence detection at %dx%d @ %dfps", FRAME_WIDTH, FRAME_HEIGHT, FRAME_FPS)
+    _classifier = PoseLSTMDetector()
+    _incident_logger = IncidentLogger()
+    source = STREAM_SOURCE
+    _active_source_type = _source_type(source)
     _ingest_process, _frame_queue, _shutdown_event = create_ingestion_pipeline(
         source=source,
         width=FRAME_WIDTH,
         height=FRAME_HEIGHT,
         fps=FRAME_FPS,
+        loop_file=True,
+        simulate_realtime=True,
     )
     _ingest_process.start()
-    log.info(f"Ingestion process started (PID={_ingest_process.pid})")
-    
-    # Start inference background task
     _inference_task = asyncio.create_task(_inference_loop())
-    
-    yield  # === App runs here ===
-    
-    # Shutdown
-    log.info("Shutting down...")
-    
-    # Cancel inference task
-    if _inference_task:
-        _inference_task.cancel()
-        try:
-            await _inference_task
-        except asyncio.CancelledError:
-            pass
-    
-    # Stop ingestion process
-    _stop_ingestion(_ingest_process, _shutdown_event)
-    if _active_upload_path:
-        _active_upload_path.unlink(missing_ok=True)
-    
-    # Close WebSocket clients
-    async with _ws_lock:
-        for ws in _ws_clients:
+
+    try:
+        yield
+    finally:
+        if _inference_task is not None:
+            _inference_task.cancel()
             try:
-                await ws.close()
-            except Exception:
+                await _inference_task
+            except asyncio.CancelledError:
                 pass
-        _ws_clients.clear()
-    
-    log.info("Violence Detection System — Stopped")
+        _stop_ingestion(_ingest_process, _shutdown_event)
+        if _active_upload_path is not None:
+            _active_upload_path.unlink(missing_ok=True)
+        async with _ws_lock:
+            for websocket in tuple(_ws_clients):
+                try:
+                    await websocket.close()
+                except (WebSocketDisconnect, RuntimeError, OSError):
+                    pass
+            _ws_clients.clear()
 
 
-# ──────────────────────────────────────────────
-# FastAPI app
-# ──────────────────────────────────────────────
 app = FastAPI(
-    title="Violence Detection System",
-    description="Edge-optimized spatio-temporal violence detection for legacy surveillance.",
-    version="1.0.0",
+    title="Spatio-Temporal Violence Detection",
+    version="2.0.0",
     lifespan=lifespan,
 )
-
-# CORS — allow frontend dev server
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -370,255 +294,148 @@ app.add_middleware(
 )
 
 
-def _stop_ingestion(
-    process: Optional[multiprocessing.Process],
-    shutdown_event: Optional[multiprocessing.Event],
-) -> None:
-    """Stop an ingestion worker and reap its process."""
-    if shutdown_event:
-        shutdown_event.set()
-    if process and process.is_alive():
-        process.join(timeout=10)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
-            if process.is_alive():
-                raise RuntimeError("Ingestion process did not stop after termination.")
-
-
-async def _swap_ingestion_source(source: str, *, loop_file: bool, upload_path: Optional[Path] = None) -> None:
-    """Start a replacement producer, then atomically make it the active source."""
-    global _frame_queue, _shutdown_event, _ingest_process
-    global _active_upload_path, _active_source, _source_generation
-
-    async with _source_lock:
-        new_process, new_queue, new_shutdown_event = create_ingestion_pipeline(
-            source=source,
-            width=FRAME_WIDTH,
-            height=FRAME_HEIGHT,
-            fps=FRAME_FPS,
-            loop_file=loop_file,
-            simulate_realtime=True,
-        )
-        try:
-            new_process.start()
-        except Exception:
-            new_shutdown_event.set()
-            raise
-
-        old_process = _ingest_process
-        old_shutdown_event = _shutdown_event
-        old_upload_path = _active_upload_path
-
-        try:
-            _stop_ingestion(old_process, old_shutdown_event)
-        except Exception:
-            _stop_ingestion(new_process, new_shutdown_event)
-            raise
-
-        _ingest_process = new_process
-        _frame_queue = new_queue
-        _shutdown_event = new_shutdown_event
-        _active_upload_path = upload_path
-        _active_source = source
-        _source_generation += 1
-
-        async with _classifier_lock:
-            if _classifier is not None:
-                _classifier.reset()
-        async with _frame_lock:
-            global _latest_frame, _latest_detections
-            _latest_frame = None
-            _latest_detections = []
-
-        if old_upload_path and old_upload_path != upload_path:
-            old_upload_path.unlink(missing_ok=True)
-
-        log.info("Ingestion source switched to %s", source)
-
-
-# ──────────────────────────────────────────────
-# ──────────────────────────────────────────────
-# REST endpoints
-# ──────────────────────────────────────────────
 @app.get("/api/health")
-async def health_check():
-    """Health check and system status."""
+async def health_check() -> dict:
     return {
-        "status": "running",
-        "stream_source": _active_source,
-        "resolution": f"{FRAME_WIDTH}x{FRAME_HEIGHT}",
-        "fps": FRAME_FPS,
-        "model": MODEL_PATH,
-        "ws_clients": len(_ws_clients),
-        "ingestion_alive": _ingest_process.is_alive() if _ingest_process else False,
+        "status": "running" if _classifier is not None else "starting",
+        "source": _active_source_type,
+        "fps_target": FRAME_FPS,
+        "ingestion_alive": bool(_ingest_process and _ingest_process.is_alive()),
+        "model": str(_classifier.model_path) if _classifier else None,
+        "websocket_clients": len(_ws_clients),
     }
 
 
 @app.post("/source/webcam")
-async def use_webcam():
-    """Switch the active source to local webcam index zero."""
+async def use_webcam() -> dict:
     if _classifier is None:
-        raise HTTPException(status_code=503, detail="Ingestion is not initialized.")
-    try:
-        await _swap_ingestion_source("0", loop_file=False)
-    except Exception as exc:
-        log.exception("Could not switch ingestion to webcam.")
-        raise HTTPException(status_code=500, detail="Could not switch to webcam.") from exc
+        raise HTTPException(status_code=503, detail="Inference model is not loaded.")
+    await _swap_source("0")
     return {"status": "ok", "source": "webcam"}
 
 
-@app.post("/upload")
-async def upload_video(file: UploadFile = File(...)):
-    """Save an uploaded MP4 and switch ingestion to its real-time playback."""
+@app.post("/source/rtsp")
+async def use_rtsp(request: RTSPSourceRequest) -> dict:
     if _classifier is None:
-        raise HTTPException(status_code=503, detail="Ingestion is not initialized.")
-    if Path(file.filename or "").suffix.lower() != ".mp4":
-        raise HTTPException(status_code=400, detail="Only .mp4 video files are supported.")
-
-    upload_dir = Path(tempfile.gettempdir()) / "violence-detection-uploads"
-    upload_path: Optional[Path] = None
+        raise HTTPException(status_code=503, detail="Inference model is not loaded.")
+    parsed = urlsplit(request.source)
+    if parsed.scheme.lower() not in {"rtsp", "rtsps"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Provide a valid rtsp:// or rtsps:// URL.")
     try:
-        upload_dir.mkdir(parents=True, exist_ok=True)
+        await _swap_source(request.source)
+    except Exception as exc:
+        log.exception("Could not switch to RTSP source.")
+        raise HTTPException(status_code=500, detail="Could not start RTSP ingestion.") from exc
+    return {"status": "ok", "source": "rtsp"}
+
+
+@app.post("/upload")
+async def upload_video(file: UploadFile = File(...)) -> dict:
+    if _classifier is None:
+        raise HTTPException(status_code=503, detail="Inference model is not loaded.")
+    if Path(file.filename or "").suffix.lower() != ".mp4":
+        raise HTTPException(status_code=400, detail="Only .mp4 videos are supported.")
+
+    directory = Path(tempfile.gettempdir()) / "violence-detection-uploads"
+    temporary_path: Optional[Path] = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
-            mode="wb", suffix=".mp4", prefix="upload-", dir=upload_dir, delete=False
-        ) as temporary_file:
-            upload_path = Path(temporary_file.name)
+            mode="wb", suffix=".mp4", prefix="upload-", dir=directory, delete=False
+        ) as destination:
+            temporary_path = Path(destination.name)
             total_bytes = 0
             while chunk := await file.read(1024 * 1024):
                 total_bytes += len(chunk)
                 if total_bytes > MAX_UPLOAD_BYTES:
                     raise HTTPException(
                         status_code=413,
-                        detail=f"Video exceeds the {MAX_UPLOAD_BYTES}-byte upload limit.",
+                        detail=f"Upload exceeds {MAX_UPLOAD_BYTES} bytes.",
                     )
-                temporary_file.write(chunk)
-
+                destination.write(chunk)
         if total_bytes == 0:
             raise HTTPException(status_code=400, detail="Uploaded video is empty.")
-
-        await _swap_ingestion_source(
-            str(upload_path), loop_file=False, upload_path=upload_path
+        await _swap_source(
+            str(temporary_path), loop_file=False, upload_path=temporary_path
         )
-        upload_path = None
+        temporary_path = None
         return {"status": "ok", "source": "upload"}
     except HTTPException:
         raise
     except Exception as exc:
-        log.exception("Could not save or start uploaded video.")
+        log.exception("Could not start uploaded MP4.")
         raise HTTPException(status_code=500, detail="Could not start uploaded video.") from exc
     finally:
         await file.close()
-        if upload_path:
-            upload_path.unlink(missing_ok=True)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 @app.get("/api/incidents")
 async def get_incidents(
     limit: int = Query(default=50, ge=1, le=500),
-    min_severity: int = Query(default=1, ge=0, le=4),
-    since: Optional[float] = Query(default=None, description="Unix timestamp"),
-):
-    """Retrieve recent violence detection incidents."""
+    since: Optional[float] = Query(default=None),
+) -> dict:
     if _incident_logger is None:
-        return JSONResponse(status_code=503, content={"error": "Logger not initialized"})
-    
-    incidents = _incident_logger.get_recent_incidents(
-        limit=limit,
-        min_severity=min_severity,
-        since_timestamp=since,
-    )
-    return {"incidents": incidents, "count": len(incidents)}
+        raise HTTPException(status_code=503, detail="Logger is not initialized.")
+    records = _incident_logger.get_recent_incidents(limit, since)
+    return {"incidents": records, "count": len(records)}
 
 
 @app.get("/api/stats")
-async def get_stats(hours: float = Query(default=24.0, ge=0.1, le=720)):
-    """Get incident statistics for the last N hours."""
+async def get_stats(hours: float = Query(default=24.0, ge=0.1, le=720)) -> dict:
     if _incident_logger is None:
-        return JSONResponse(status_code=503, content={"error": "Logger not initialized"})
-    
-    stats = _incident_logger.get_incident_count(since_hours=hours)
-    return stats
+        raise HTTPException(status_code=503, detail="Logger is not initialized.")
+    return _incident_logger.get_incident_count(hours)
 
 
-# ──────────────────────────────────────────────
-# WebSocket endpoint
-# ──────────────────────────────────────────────
 @app.websocket("/ws/stream")
-async def websocket_stream(ws: WebSocket):
-    """
-    Live video + incident stream via WebSocket.
-    
-    Messages sent to client:
-        {"type": "frame", "data": "<base64 JPEG>", "detections": N,
-         "is_violence": bool, "timestamp": T}
-        {"type": "incident", "data": {incident record}}
-    """
-    await ws.accept()
-    log.info(f"WebSocket client connected. Total: {len(_ws_clients) + 1}")
-    
+async def websocket_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
     async with _ws_lock:
-        _ws_clients.add(ws)
-    
+        _ws_clients.add(websocket)
     try:
-        # Keep connection alive by reading (client can send ping/config)
         while True:
+            message = await websocket.receive_text()
             try:
-                data = await ws.receive_text()
-                # Could handle client commands here (e.g., change thresholds)
-                msg = json.loads(data)
-                if msg.get("type") == "ping":
-                    await ws.send_text(json.dumps({"type": "pong"}))
-            except WebSocketDisconnect:
-                break
-            except Exception:
-                break
+                if json.loads(message).get("type") == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+            except json.JSONDecodeError:
+                await websocket.send_text(json.dumps({"type": "error", "detail": "Invalid JSON"}))
+    except WebSocketDisconnect:
+        pass
     finally:
         async with _ws_lock:
-            _ws_clients.discard(ws)
-        log.info(f"WebSocket client disconnected. Remaining: {len(_ws_clients)}")
+            _ws_clients.discard(websocket)
 
 
-# ──────────────────────────────────────────────
-# Static Frontend Mount (Next.js export)
-# ──────────────────────────────────────────────
-_frontend_candidates = [
-    Path(__file__).parent.parent / "frontend" / "out",
-    Path(__file__).parent / "static",
-    Path("/app/frontend/out"),
-    Path("/app/static"),
-]
-_frontend_dir = next((p for p in _frontend_candidates if p.exists() and p.is_dir()), None)
-
-if _frontend_dir:
-    log.info(f"Mounting static Next.js frontend export from: {_frontend_dir}")
-    app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")
+frontend_dir = next(
+    (
+        path
+        for path in (
+            Path(__file__).parent.parent / "frontend" / "out",
+            Path("/app/frontend/out"),
+        )
+        if path.is_dir()
+    ),
+    None,
+)
+if frontend_dir is not None:
+    app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")
 else:
     @app.get("/")
-    async def root_fallback():
-        return {
-            "status": "running",
-            "service": "Violence Detection System",
-            "stream_source": STREAM_SOURCE,
-            "clients": len(_ws_clients),
-        }
+    async def root() -> dict:
+        return {"service": "Spatio-Temporal Violence Detection", "status": "running"}
 
 
-# ──────────────────────────────────────────────
-# Entry point
-# ──────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    
-    # Ensure multiprocessing works on Windows
+
     multiprocessing.freeze_support()
-    
-    port = int(os.getenv("PORT", "7860"))
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=port,
-        reload=False,
+        port=int(os.getenv("PORT", "7860")),
         log_level=LOG_LEVEL.lower(),
         ws_ping_interval=30,
         ws_ping_timeout=10,

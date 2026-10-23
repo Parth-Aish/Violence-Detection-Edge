@@ -46,7 +46,7 @@ class StreamConfig:
     source: str                         # RTSP URL or local file path
     width: int = 640                    # Output frame width
     height: int = 480                   # Output frame height
-    fps: int = 15                       # Target FPS (decimation / pacing)
+    fps: int = 30                       # Target FPS (decimation / pacing)
     pixel_format: str = "bgr24"         # Output pixel format (BGR for OpenCV compat)
     reconnect_delay_init: float = 1.0   # Initial reconnect delay (seconds)
     reconnect_delay_max: float = 30.0   # Maximum reconnect delay cap
@@ -357,7 +357,7 @@ def create_ingestion_pipeline(
     source: str,
     width: int = 640,
     height: int = 480,
-    fps: int = 15,
+    fps: int = 30,
     loop_file: bool = True,
     simulate_realtime: bool = True,
 ) -> tuple[multiprocessing.Process, multiprocessing.Queue, multiprocessing.Event]:

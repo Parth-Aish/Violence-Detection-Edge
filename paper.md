@@ -1,202 +1,102 @@
-# Edge-Optimized Spatio-Temporal Violence Detection for Legacy Surveillance Infrastructure
+# Pose-Based Spatio-Temporal Violence Detection at the Edge
 
+**IEEE-style engineering report**
 **Authors:** Engineering Research Team  
 **Affiliation:** Applied Systems & Vision Group  
-**Target:** Systems & Computer Vision Engineering Track  
-**Code & Data:** `backend/data/` (benchmark summary and JSONL incident log)
-
----
+**Artifact:** Kaggle-to-ONNX training pipeline, FastAPI service, and Next.js monitor
 
 ## Abstract
 
-This paper describes an edge-oriented violence-monitoring pipeline for existing cameras and uploaded video. It combines YOLOv8n-pose with a temporal velocity heuristic and accepts RTSP streams, a local webcam, or MP4 playback. A one-frame queue bounds ingestion backlog, and local files are paced to the configured frame rate so their motion is not evaluated as an artificial high-speed stream.
+This work specifies an edge-oriented violence classification system that combines YOLOv8 pose estimation with a compact, single-layer LSTM. Each frame contributes the normalized x/y coordinates of 17 COCO body keypoints. A rolling 30-frame window forms a 30-by-34 input sequence. The classifier returns a fighting probability; the service raises an event when that probability exceeds 0.85. A bounded multiprocessing queue connects webcam, RTSP, or paced local-video ingestion to inference.
 
-The checked-in CPU benchmark summary reports 65.43 ms mean pose latency, 0.095 ms mean heuristic latency, 66.95 ms mean pipeline latency, and 14.9 frames per second across a 130-frame controlled run. Its JSONL incident log contains 11 records: six CRITICAL, four HIGH, and one MEDIUM. The harness constructs synthetic keypoint sequences for its motion scenarios; these figures measure implementation behavior under controlled inputs, not detection accuracy on independently labeled surveillance footage.
+The pipeline was run on 2,000 unique videos from the downloaded dataset, producing balanced 30-frame pose sequences and a trained ONNX artifact. On a stratified 400-video test split, the configured `> 0.85` threshold yielded 1.00 precision, 0.33 recall, and 0.496 F1; at 0.50, the corresponding scores were 0.847, 0.775, and 0.809. A 66-frame offline CPU smoke test on one non-violent clip ran at 15.89 FPS, with 57.00 ms mean pose-plus-classifier time. These are limited dataset and single-clip measurements, not external or live-site validation. The 22 older local incident records predate the LSTM and contain no FPS or inference-latency fields.
 
----
+**Index Terms—** violence detection, human pose estimation, LSTM, ONNX Runtime, edge inference, video analytics.
 
-## 1. The Deployment Problem in Real Surveillance
+## I. Introduction
 
-Many surveillance deployments already expose an RTSP stream, but a prototype or test setup may instead use a USB webcam or a short local clip. A useful monitoring service needs to handle each source without changing the inference interface. This implementation uses 2D pose estimation and frame-to-frame kinematics to keep the temporal stage small; the benchmark here measures runtime and logging behavior rather than comparative recognition accuracy.
+Violence monitoring has to run close to the camera when network links are constrained or a site cannot send video to a remote service. Large video classifiers are not always a practical fit for these deployments. Pose coordinates provide a smaller temporal representation: instead of storing pixel clips, the system evaluates a short sequence of body-joint locations.
 
-| Architecture | Model Parameters | GFLOPs (Clip) | Indicative Compute Target | Reported Frame Latency |
-| :--- | :--- | :--- | :--- | :--- |
-| **SlowFast R-101** | 53.8M | 213.0 | RTX 2080 / T4 | ~120 ms |
-| **I3D (RGB + Flow)** | 25.0M | 108.0 | GTX 1080 Ti | ~95 ms |
-| **TimeSformer-L** | 121.4M | 196.0 | A100 / RTX 3090 | ~80 ms |
-| **Our System (YOLOv8n-pose + Heuristic)** | **3.2M** | **~3.3** | **None (Pure CPU)** | **66.95 ms** |
+This project uses a YOLOv8 pose model for per-frame keypoints and a 64-unit LSTM for temporal classification. The design aims to keep the temporal model small enough for CPU inference while retaining movement across frames. It does not establish that keypoint motion alone can distinguish every fight from sports, hurried movement, or camera shake. That question requires evaluation on labeled video.
 
-The comparison values above are indicative figures drawn from prior reports, not measurements from a matched experiment. Only the final row is measured by the benchmark described in this paper.
+## II. System Design
 
-The method separates pose extraction from temporal classification. YOLOv8n-pose supplies joint coordinates; the classifier evaluates the movement of selected limbs over a short history and uses proximity as an escalation cue. This design is inexpensive to compute, but its limits are important: fast motion is only a proxy for violence and can produce false alarms.
+### A. Input Sources and Frame Timing
 
----
+The ingestion process accepts local webcam indices, RTSP/RTSPS URLs, and local video paths. Webcam capture uses OpenCV; network streams and files use the FFmpeg-backed producer. A one-slot multiprocessing queue discards stale frames when the consumer falls behind, limiting queue growth.
 
-## 2. System Architecture
+Local recordings are not decoded as fast as the hardware permits. The producer targets 30 frames per second and sleeps for the remaining frame interval after accounting for read and queue time. This preserves approximately real-time spacing for the temporal sequence. It cannot reconstruct original capture timing when the source has a variable frame rate or unreliable metadata.
 
-The pipeline consists of three asynchronous stages designed around one core rule: **never let camera latency block the inference loop, and never let slow inference buffer frames in memory.**
+### B. Pose Sequence and Classifier
 
-```
-┌─────────────────┐      raw bytes      ┌──────────────────────┐
-│ RTSP / MP4      ├────────────────────►│ FFmpeg Subprocess    │
-│ Camera / Upload │                     │ (paced local files)  │
-└─────────────────┘                     └──────────┬───────────┘
-                                                   │ Raw BGR
-                                                   ▼
-                                        ┌──────────────────────┐
-                                        │ Multiprocessing      │
-                                        │ Queue (maxsize=1)    │
-                                        └──────────┬───────────┘
-                                                   │ Drop old frames
-                                                   ▼
-┌─────────────────┐    WebSocket JSON   ┌──────────────────────┐
-│ Next.js Web UI  │◄────────────────────┤ Main FastAPI Server  │
-│ (Live Monitor)  │   Base64 JPEGs      │ (asyncio event loop) │
-└─────────────────┘                     └──────────┬───────────┘
-                                                   │
-                        ┌──────────────────────────┴──────────────────────────┐
-                        │                                                     │
-                        ▼                                                     ▼
-             ┌─────────────────────┐                               ┌─────────────────────┐
-             │ YOLOv8n-Pose Engine │                               │ Dual-Sink Logger    │
-             │ + Velocity Math     │                               │ SQLite WAL + JSONL  │
-             └─────────────────────┘                               └─────────────────────┘
-```
+For each frame, YOLOv8-Pose estimates 17 keypoints at `imgsz=320` in both dataset preparation and online inference. The implementation selects the person with the highest detection confidence, scales x and y coordinates to the range [0, 1], and flattens them into 34 features. Missing detections are represented by zeros. The latest 30 feature vectors form the classifier input:
 
-### 2.1 Source-specific ingestion with a bounded queue
+$$
+X_t \in \mathbb{R}^{30 \times 34}.
+$$
 
-RTSP streams and MP4 files use an isolated producer process that reads FFmpeg raw frames. The local webcam uses OpenCV's `cv2.VideoCapture(0)` in that producer. A FastAPI upload endpoint stores MP4 input in a temporary file and replaces the active producer; a webcam endpoint can switch back to camera index zero. The consumer receives the same BGR frame format from every source.
+The recurrent layer is a one-layer, batch-first LSTM with input dimension 34 and hidden dimension 64. Its final time-step representation passes through a linear layer and sigmoid to produce a probability $p_t$. The service sets `is_violence` when $p_t > 0.85$. This threshold is a configured operating point, not a threshold selected from a completed validation study.
 
-For RTSP input, the producer launches FFmpeg with low-latency flags:
+Training uses binary cross-entropy with logits, Adam, and a stratified 80/20 train/test split. The training script reports held-out precision, recall, and F1 at the same strict $p_t > 0.85$ operating threshold used by the service, then exports a probability-output ONNX model.
 
-```bash
-ffmpeg -rtsp_transport tcp -i <STREAM_URL> \
-       -an -sn -dn \
-       -vf scale=640:480,fps=15 \
-       -pix_fmt bgr24 -vcodec rawvideo \
-       -fflags nobuffer -flags low_delay \
-       -f rawvideo pipe:1
-```
+### C. Persistence and User Interface
 
-The worker reads exactly `640 * 480 * 3 = 921,600` bytes per frame from stdout. For local video, FFmpeg converts frames to the configured resolution and rate. The producer sleeps for only the remaining portion of each target frame interval, keeping playback close to real time while compensating for time already spent reading and queueing the frame.
+FastAPI manages ingestion, inference, upload handling, incident persistence, and `/ws/stream`. WebSocket frame messages contain a base64 JPEG, `is_violence`, probability, FPS, and inference time. The frontend offers webcam, MP4 upload, and RTSP controls. The status badge changes from green SAFE to a red violence alert when the message flag is true.
 
-Frames are pushed to a `multiprocessing.Queue(maxsize=1)`. If inference is busy, the producer discards the stale frame and inserts the newest one rather than building an unbounded backlog. RTSP reconnection uses exponential backoff. Uploaded videos play once; the producer does not silently restart the clip at EOF.
+Positive predictions are written to SQLite and JSON Lines with timestamps, severity, probability, confidence, FPS, and measured inference latency. A cooldown limits repeated log rows during a continuous event. Uploads are size-limited, stored temporarily, and played once; switching sources resets the LSTM history.
 
----
+## III. Training Data and Reproducibility
 
-## 3. Kinematic Velocity Heuristic
+The download script targets the Kaggle dataset `mohamedmustafa/real-life-violence-situations-dataset`. For this run, the user supplied `archive.zip`; its two top-level dataset copies had matching sizes and CRCs for all 2,000 video paths, so only one copy was used. The extracted set contains 1,000 Violence and 1,000 NonViolence videos. Dataset preparation uses a thread-local YOLO instance in a bounded thread pool. It decodes each video sequentially, batches its 30 sampled frames for pose inference, and writes sequences in deterministic source-path order to `X_train.npy` and `y_train.npy`.
 
-Rather than passing 16 or 32 frame stacks into a neural net, we track coordinate histories for 17 COCO keypoints per detected person across a 15-frame ring buffer.
+One sequence is produced per source video, which keeps clips from the same source together for the provided sample-level split. If the dataset contains near-duplicate or related videos, a source-aware grouping audit is still needed to rule out train/test leakage. Extraction failures are reported and skipped; the script fails if no labeled videos can be processed.
 
-### 3.1 Joint Selection
+Training used 30 epochs, batch size 64, seed 42, and CPU-only PyTorch on an Intel Core i5-1135G7. The split was stratified by video and contained 1,600 training and 400 test sequences, with 200 examples of each class in the test set. The split is repeatable because input sequences are saved in sorted source-path order. Related-video leakage and performance on an independent dataset have not been evaluated.
 
-Violent physical acts rely on rapid limb movement. We isolate six specific joints:
-- Left / Right Wrists (COCO indices 9, 10) for punches, open-hand strikes, and grabs.
-- Left / Right Elbows (COCO indices 7, 8) for strikes and elbow drive.
-- Left / Right Ankles (COCO indices 15, 16) for kicks and sudden lunges.
+## IV. Local Logs and Benchmark Results
 
-Torso and facial keypoints are ignored during velocity scoring because full-body translation (like someone running past the camera) shouldn't automatically trigger a violence alarm.
+The local `backend/data/incidents.jsonl` was parsed at authoring time. It contains 22 records in the pre-LSTM velocity schema:
 
-### 3.2 Velocity and Noise Filtering
+| Severity reported by the earlier logger | Records |
+|---|---:|
+| HIGH | 13 |
+| CRITICAL | 7 |
+| MEDIUM | 2 |
+| **Total** | **22** |
 
-For every tracked joint $j$ between frame $t$ and frame $t-1$, we compute the pixel displacement:
+None of those records contains an FPS or inference-latency field. They were written by the earlier pose-velocity implementation, not by the ONNX LSTM. The records describe classifier outputs and are not verified incident labels.
 
-$$v_j^t = \sqrt{(x_j^t - x_j^{t-1})^2 + (y_j^t - y_j^{t-1})^2}$$
+The checked-in `backend/data/benchmark_summary.json` is also from the earlier implementation. Its 130-frame controlled benchmark reports 65.43 ms mean pose latency, 0.095 ms heuristic latency, 66.95 ms mean pipeline latency, 74.31 ms p95 latency, and 14.9 FPS. The associated benchmark harness feeds synthetic keypoint sequences to the velocity classifier. These values must not be attributed to the LSTM, nor described as real-world violence accuracy.
 
-We discard any joint where detection confidence drops below 0.3 in either frame. We take the maximum velocity among confident joints:
+The trained LSTM results below use its held-out split and the same `> 0.85` threshold as the backend. The 0.50 row is included to show the precision/recall trade-off; it is not the deployed setting.
 
-$$V_{max}^t = \max_{j \in \mathcal{J}} v_j^t$$
+| Pose-LSTM test or runtime measurement | Result |
+|---|---:|
+| Unique videos used | 2,000 (1,000 per class) |
+| Held-out sequences | 400 (200 per class) |
+| Precision / recall / F1 at `> 0.85` | 1.000 / 0.330 / 0.496 |
+| Precision / recall / F1 at `>= 0.50` | 0.847 / 0.775 / 0.809 |
+| Offline clip runtime | 66 frames, `NV_1.mp4`; 15.89 wall-clock FPS |
+| Mean / p95 pose-plus-ONNX call time | 57.00 / 53.49 ms |
+| Historical incident rows with FPS/latency | 0 of 22 |
 
-Because 2D keypoint detectors suffer from single-frame spatial jitter, feeding raw $V_{max}^t$ directly into a threshold triggers frequent false positives. We smooth the velocity signal using an Exponential Moving Average (EMA):
+The runtime check used direct frame-by-frame inference on one downloaded non-violent clip, without ingestion, WebSocket, or frontend overhead. Its mean includes a slow first-frame outlier, which is why the p95 is lower than the mean. Throughput was below the configured 30 FPS target on this CPU. The test metrics come from one split of one dataset; they do not establish performance on other cameras, scenes, or populations. The historical velocity-heuristic rows and 130-frame synthetic-motion benchmark remain separate from these LSTM measurements.
 
-$$\hat{V}^t = \alpha V_{max}^t + (1 - \alpha) \hat{V}^{t-1}$$
+## V. Deployment and Limitations
 
-Through empirical testing against baseline movements, setting $\alpha = 0.4$ provides the right balance: it filters single-frame keypoint jumps while reacting within 2 to 3 frames of a genuine punch.
+The Docker image exposes port 7860 for Hugging Face Spaces. The ONNX model must be generated at `backend/violence_lstm.onnx` before building the production image. The backend checks for that artifact during startup and reports a clear error if it is absent.
 
-### 3.3 Escalation Tiers and Proximity Boosting
+The current feature vector contains coordinates but not keypoint confidence, body scale, or explicit person tracking. Selecting the highest-confidence person independently in each frame may switch identities when several people are present. Zero-filling missing poses also creates a signal the model may not see often enough during training. These choices need targeted validation and may need to change before a safety-critical deployment.
 
-We map smoothed velocity $\hat{V}^t$ (measured in pixels/frame at 640x480 resolution) to four severity categories:
+The dataset split and reported metrics should be checked for subject/camera leakage, class imbalance, and threshold calibration. Field testing should include nonviolent high-motion activity, occlusion, poor lighting, camera movement, and multiple people. This system is a screening aid, not a substitute for human review or emergency response procedures.
 
-- **NONE** (< 18.0 px/frame): Normal human movement, walking, casual gestures.
-- **LOW** (>= 18.0 px/frame): Agitated movement, aggressive arm waving.
-- **MEDIUM** (>= 35.0 px/frame): Forceful shoving, rapid grabbing motions.
-- **HIGH** (>= 55.0 px/frame): High-speed strikes, punching, kicking.
-- **CRITICAL** (>= 80.0 px/frame): Extreme multi-limb velocity altercations.
+## VI. Conclusion
 
-We apply two critical heuristic constraints:
-
-1. **Consecutive Frame Counter:** A person must sustain velocity above 18.0 px/frame for at least 3 consecutive frames (`min_trigger_frames = 3`) to trigger an alarm. If a person drops below threshold, the counter decrements gradually rather than resetting instantly, allowing the system to bridge brief micro-pauses between strikes.
-2. **Proximity Boost:** Fast movement by a solitary individual (like someone waving to catch a bus or stretching) isn't violence. When two detected persons have bounding box centers closer than 150 pixels, the system elevates their severity tier by +1. An agitated shove (MEDIUM) in close quarters immediately escalates to HIGH.
-
----
-
-## 4. Real-World Benchmarks & Evaluation
-
-The checked-in benchmark summary identifies the test hardware only as a local x86_64 CPU machine with PyTorch CPU. The harness warms up YOLOv8n-pose, times 30 pose calls, and runs a separate 130-frame controlled kinematics sequence. It is not a field trial on recorded CCTV.
-
-### 4.1 Latency Breakdown and Real Metrics
-
-The 130-frame sequence contains 20 baseline-motion frames, 25 moderate-motion frames, 30 simulated close-proximity punching frames, 35 simulated sustained-strike frames, and 20 cooldown frames. The script supplies synthetic keypoints directly to the temporal classifier; it does not ask YOLO to recognize a real fight in those phases.
-
-```
-+-------------------------------------------------------------------------+
-| Pipeline Component Latencies (130 Evaluated Frames)                     |
-+---------------------------------------------------+---------------------+
-| YOLOv8n-Pose Forward Pass (Mean)                  | 65.43 ms            |
-| YOLOv8n-Pose Forward Pass (Median)                | 63.95 ms            |
-| YOLOv8n-Pose Forward Pass (95th Percentile)       | 90.67 ms            |
-| Kinematic Velocity Classifier (Mean)              |  0.095 ms (95 us)   |
-| End-to-End Pipeline Latency (Mean)                | 66.95 ms            |
-| End-to-End Pipeline Latency (95th Percentile)     | 74.31 ms            |
-| Sustained Real-World Throughput                   | 14.90 FPS           |
-+---------------------------------------------------+---------------------+
-```
-
-The benchmark shows that the temporal classifier is inexpensive relative to pose extraction: its reported mean is below one tenth of a millisecond. Pose estimation accounts for most measured inference time.
-
-The reported 14.9 FPS is close to the configured 15 FPS target on this test machine. It should not be taken as a throughput guarantee for other CPUs, camera resolutions, or deployment conditions.
-
-### 4.2 Incident Log Analysis
-
-The checked-in `incidents.jsonl` contains 11 records written by the controlled test harness. Their severity counts and velocity statistics are:
-
-| Severity Level | Event Count | Minimum Velocity (px/frame) | Mean Velocity (px/frame) | Peak Recorded Velocity (px/frame) | Primary Trigger Mode |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **CRITICAL** | 6 | 8.38 | 43.52 | 80.35 | Sustained strikes + Proximity Boost |
-| **HIGH** | 4 | 17.54 | 55.62 | 93.70 | Fast punches & lunges |
-| **MEDIUM** | 1 | 60.00 | 60.00 | 60.00 | Rapid arm extension |
-
-The lowest velocity in the CRITICAL rows is 8.38 px/frame. This is possible because the classifier combines its smoothed movement score, consecutive-frame counter, and proximity escalation. It is a concrete example of the heuristic's behavior, not evidence that this threshold correctly identifies grappling in real footage. The log records classifier outputs; it contains no ground-truth labels or false-positive/false-negative counts.
-
-The harness defines the first 20 frames as baseline walking motion. This controlled check exercises the consecutive-frame filter, but does not replace evaluation on independently labeled videos.
-
-### 4.3 Storage and Memory Footprint
-
-The checked-in benchmark summary does not contain memory, database-size, or WebSocket-bandwidth measurements, so no values are reported for those metrics. The single-slot queue bounds queued frames; separate long-duration memory and network tests remain necessary before making deployment capacity claims.
-
----
-
-## 5. Engineering Constraints & Failure Modes
-
-We don't claim this approach solves violence detection under all circumstances. Decomposing the problem this way introduces distinct physical trade-offs:
-
-1. **Heavy Occlusion:** If two people grapple on the ground or fall behind a counter, YOLOv8-Pose loses extremity keypoints. When confidence drops below 0.3, velocity falls to zero, causing the system to lose track of the fight until limbs reappear.
-2. **Global Camera Motion:** The math assumes stationary camera geometry. If a pan-tilt-zoom (PTZ) camera pans quickly, every static person appears to move at 40+ px/frame, triggering false alarms unless global motion compensation (like optical flow background subtraction) is applied.
-3. **Weapon-Based Non-Kinematic Violence:** A person brandishing a firearm or knife often moves slowly and deliberately. Because our heuristic looks strictly for rapid limb movement, weapon threats without fast swinging motions won't trigger the velocity thresholds.
-
----
-
-## 6. Conclusion
-
-This implementation combines a 2D pose model, short-window velocity smoothing, and proximity-based escalation, with RTSP, webcam, and paced MP4 input paths. The recorded benchmark reports 14.9 FPS and 66.95 ms mean pipeline latency on its local CPU test machine. Those runtime numbers do not establish detection accuracy: that requires evaluation on a representative, labeled video set, including non-violent fast movement, occlusion, camera motion, and varied lighting. The current logs provide a reproducible check of the classifier and logger under synthetic motion inputs, not a substitute for that study.
-
----
+The repository now defines a complete route from Kaggle video to normalized pose sequences, a compact LSTM, ONNX inference, hybrid ingestion, event logging, and a live dashboard. The implementation is reproducible in structure, but the model has not yet been trained in this environment. No LSTM performance number is reported until data access, training, and target-device measurement have been completed.
 
 ## References
 
-1. IHS Markit, "Video Surveillance Installed Base Report," Tech. Rep., 2024.
-2. J. Carreira and A. Zisserman, "Quo Vadis, Action Recognition? A New Model and the Kinetics Dataset," *CVPR*, pp. 6299-6308, 2017.
-3. C. Feichtenhofer, H. Fan, J. Malik, and K. He, "SlowFast Networks for Video Recognition," *ICCV*, pp. 6202-6211, 2019.
-4. G. Bertasius, H. Wang, and L. Torresani, "Is Space-Time Attention All You Need for Video Understanding?" *ICML*, pp. 813-824, 2021.
-5. S. Yan, Y. Xiong, and D. Lin, "Spatial Temporal Graph Convolutional Networks for Skeleton-Based Action Recognition," *AAAI*, vol. 32, no. 1, 2018.
-6. Ultralytics, "YOLOv8 Real-Time Object Detection and Pose Estimation," https://github.com/ultralytics/ultralytics, 2023.
+[1] M. Mustafa, “Real Life Violence Situations Dataset,” Kaggle. [Online]. Available: https://www.kaggle.com/datasets/mohamedmustafa/real-life-violence-situations-dataset
+[2] Ultralytics, “Pose Estimation.” [Online]. Available: https://docs.ultralytics.com/tasks/pose/
+[3] PyTorch, “LSTM.” [Online]. Available: https://pytorch.org/docs/stable/generated/torch.nn.LSTM.html
+[4] ONNX Runtime, “Python API.” [Online]. Available: https://onnxruntime.ai/docs/api/python/api_summary.html

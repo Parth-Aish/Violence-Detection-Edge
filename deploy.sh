@@ -3,18 +3,16 @@
 # deploy.sh — Hugging Face Spaces Deployment Script
 # ════════════════════════════════════════════════════════════════════
 # Usage:
-#   ./deploy.sh [SPACE_NAME] [HF_TOKEN]
+#   HF_TOKEN=hf_... ./deploy.sh [USERNAME/SPACE_NAME]
 #
 # Examples:
-#   ./deploy.sh
-#   ./deploy.sh violence-detection
-#   ./deploy.sh my-org/violence-detection hf_xxxxxxxxxxxx
+#   HF_TOKEN=hf_... ./deploy.sh
+#   HF_TOKEN=hf_... ./deploy.sh my-org/violence-detection
 # ════════════════════════════════════════════════════════════════════
 
 set -e
 
 SPACE_NAME="${1:-violence-detection}"
-HF_TOKEN="${2:-$HF_TOKEN}"
 
 echo "================================================================="
 echo "  Deploying Violence Detection System to Hugging Face Spaces"
@@ -48,10 +46,17 @@ if [ ! -f "deploy.py" ] || [ ! -f "Dockerfile" ]; then
     exit 1
 fi
 
-# 4. Invoke automated deployment engine. It reads HF_TOKEN from the environment.
-echo "[DEPLOY] Initializing Space and uploading repository..."
-if [ -n "$HF_TOKEN" ]; then
-    export HF_TOKEN
+if [ -z "${HF_TOKEN:-}" ]; then
+    echo "[ERROR] Set HF_TOKEN in the environment before deployment."
+    exit 1
 fi
 
+if [ ! -s "backend/violence_lstm.onnx" ]; then
+    echo "[ERROR] backend/violence_lstm.onnx is missing. Train and export the model first."
+    exit 1
+fi
+
+# 4. Create/update the Docker Space and upload the filtered project directory.
+echo "[DEPLOY] Initializing Space and uploading repository..."
+export HF_TOKEN
 "$PYTHON_BIN" deploy.py --space-name "$SPACE_NAME"
