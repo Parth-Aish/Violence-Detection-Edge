@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader, TensorDataset
 ROOT = Path(__file__).resolve().parent
 SEQUENCE_LENGTH = 30
 FEATURES = 34
-OPERATIONAL_THRESHOLD = 0.85
+OPERATIONAL_THRESHOLD = 0.75
 
 
 class ViolenceLSTM(nn.Module):

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: violence-detection-edge
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: STREAM_SOURCE
+        value: idle
+      - key: FRAME_FPS
+        value: "8"
+      - key: ONNX_INTRA_OP_THREADS
+        value: "1"
+      - key: VIOLENCE_THRESHOLD
+        value: "0.85"

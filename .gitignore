@@ -17,12 +17,12 @@ env/
 *.pt
 *.onnx
 !backend/violence_lstm.onnx
+!backend/yolov8n-pose.onnx
 *.engine
 runs/
 
 # Training artifacts and dataset downloads
-/data/raw/
-/data/processed/
+/data/
 *.npy
 kaggle.json
 **/kaggle.json

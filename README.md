@@ -1,25 +1,14 @@
----
-title: Pose-Based Violence Detection
-emoji: 🚨
-colorFrom: red
-colorTo: gray
-sdk: docker
-app_port: 7860
-pinned: false
-license: mit
----
-
 # Pose-Based Spatio-Temporal Violence Detection
 
-This repository contains a train-to-deploy video classification pipeline. YOLOv8-Pose extracts 17 body keypoints per frame; a single-layer, 64-unit PyTorch LSTM classifies 30-frame sequences of normalized x/y coordinates (34 features per frame). The model is exported to ONNX and the backend emits a positive violence decision when the output probability is greater than `0.85`.
+This repository contains a train-to-deploy video classification pipeline. An exported YOLOv8-Pose ONNX model extracts 17 body keypoints per frame; a single-layer, 64-unit LSTM ONNX model classifies 30-frame sequences of normalized x/y coordinates (34 features per frame). The production backend uses ONNX Runtime and OpenCV only for inference; it does not install PyTorch or Ultralytics. The backend uses a default probability threshold of `0.75` and emits a positive violence decision only after three consecutive above-threshold inference results.
 
-The project accepts webcam, RTSP/RTSPS, and MP4 sources. It uses a one-frame producer-consumer queue, paces local video at 30 FPS by default, and logs incident timestamps, probability, severity, FPS, and inference latency to SQLite and JSONL.
+The project accepts webcam, RTSP/RTSPS, and MP4 sources. Local ingestion defaults to 15 FPS with an asyncio queue bounded to 30 frames. The classifier uses a default probability threshold of `0.75` and requires three consecutive above-threshold inference results before raising a violence alert. The Render Blueprint deliberately sets `FRAME_FPS=8` and `VIOLENCE_THRESHOLD=0.85` for its constrained CPU plan. Incident timestamps, probability, severity, FPS, and inference latency are logged to SQLite and JSONL.
 
 ## Data and model workflow
 
-### 1. Install dependencies
+### 1. Install runtime dependencies
 
-From the repository root, create a Python virtual environment and install the requirements:
+For API serving and ONNX inference, create a Python virtual environment and install the minimal runtime requirements:
 
 ```bash
 python -m venv .venv
@@ -30,7 +19,15 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-### 2. Configure Kaggle access and download the dataset
+### 2. Install training-only dependencies
+
+Only needed when downloading data, extracting keypoints, or retraining the models. These do not belong in the Render runtime image:
+
+```bash
+python -m pip install -r training-requirements.txt
+```
+
+### 3. Configure Kaggle access and download the dataset
 
 Authenticate using `kaggle auth login`, set `KAGGLE_API_TOKEN`, or configure `KAGGLE_USERNAME` and `KAGGLE_KEY` / the standard `~/.kaggle/kaggle.json` file. Keep all credential files out of version control.
 
@@ -40,16 +37,23 @@ python kaggle_pipeline.py
 
 The downloader extracts `mohamedmustafa/real-life-violence-situations-dataset` under `data/raw/`. Dataset access is subject to Kaggle's access and use terms.
 
-### 3. Extract pose sequences and train
+### 4. Extract pose sequences and train
 
-The dataset preparation script expects class directories named `Violence` and `NonViolence` (or equivalent recognized class-folder names). It samples 30 frames per video, runs YOLOv8-Pose concurrently, and writes float32 features and binary labels:
+The dataset preparation script expects class directories named `Violence` and `NonViolence` (or equivalent recognized class-folder names). Download the YOLOv8-Pose checkpoint as `yolov8n-pose.pt` in the project root; `.pt` files and all of `data/` are excluded from Git and Docker. The script samples 30 frames per video, runs YOLOv8-Pose concurrently, and writes float32 features and binary labels:
 
 ```bash
-python dataset_prep.py --dataset-dir data/raw --output-dir data/processed --workers 2
+python dataset_prep.py --dataset-dir data/raw --output-dir data/processed --workers 2 --model yolov8n-pose.pt
 python train_model.py --features data/processed/X_train.npy --labels data/processed/y_train.npy --onnx-out backend/violence_lstm.onnx
 ```
 
-Training uses a stratified 80/20 split and prints held-out precision, recall, and F1 at the same strict `> 0.85` decision threshold used by the online backend, plus reference metrics at `0.50`. Do not treat benchmark metrics as meaningful until the dataset split, class distribution, and model have been reviewed. The trained ONNX file is required to start the inference backend and build the Docker image.
+Export the pose checkpoint for deployment after preparing the sequences. The export lands in the project root; move it into the production backend directory:
+
+```bash
+python -c "from ultralytics import YOLO; YOLO('yolov8n-pose.pt').export(format='onnx', simplify=True, imgsz=320)"
+python -c "from pathlib import Path; Path('yolov8n-pose.onnx').replace('backend/yolov8n-pose.onnx')"
+```
+
+This creates `backend/yolov8n-pose.onnx`. Training uses a stratified 80/20 split and prints held-out precision, recall, and F1 at the `> 0.75` probability threshold, plus reference metrics at `0.50`. The training report evaluates individual sequences and does not model the online three-consecutive-result debounce. Both ONNX files are required to start the inference backend and build the Docker image.
 
 ## Run locally
 
@@ -60,7 +64,7 @@ cd backend
 python main.py
 ```
 
-The API listens on port 7860 by default. In a separate terminal, run the Next.js UI:
+The API listens on port 7860 by default for local development and starts idle until a source is selected. Render supplies its own port (configured as 10000). In a separate terminal, run the Next.js UI:
 
 ```bash
 cd frontend
@@ -68,7 +72,7 @@ npm ci
 npm run dev
 ```
 
-Open `http://localhost:3000`. Use the Webcam control for camera index zero, upload an MP4 with the Upload Video control, or provide an `rtsp://` / `rtsps://` URL and select Use RTSP. MP4 playback runs once at the configured ingestion rate. Uploads are limited to 500 MiB by default.
+Open `http://localhost:3000`. Use the Webcam control for camera index zero, upload an MP4 with the Upload Video control, or provide an `rtsp://` / `rtsps://` URL and select Use RTSP. MP4 playback runs once at the configured ingestion rate. Uploads are limited to 100 MiB by default. Local ingestion defaults to and is capped at 15 FPS.
 
 ## WebSocket and REST API
 
@@ -91,7 +95,7 @@ Available endpoints:
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/health` | Backend and ingestion status |
+| `GET` | `/api/health` | Backend, ingestion, violence threshold, and debounce configuration |
 | `GET` | `/api/incidents` | Recent SQLite incidents |
 | `GET` | `/api/stats` | Severity counts |
 | `POST` | `/source/webcam` | Switch to local webcam index zero |
@@ -103,33 +107,42 @@ Available endpoints:
 
 | Variable | Default | Description |
 |---|---:|---|
-| `STREAM_SOURCE` | `0` | Initial webcam index, RTSP URL, or local file |
+| `STREAM_SOURCE` | `idle` | Initial webcam index, RTSP URL, local file, or `idle` |
 | `FRAME_WIDTH` | `640` | Inference frame width |
 | `FRAME_HEIGHT` | `480` | Inference frame height |
-| `FRAME_FPS` | `30` | Ingestion and local-video pacing rate |
-| `POSE_MODEL_PATH` | `yolov8n-pose.pt` | Ultralytics pose model |
+| `FRAME_FPS` | `15` | Ingestion and local-video pacing rate (maximum 15 FPS) |
+| `POSE_MODEL_PATH` | `backend/yolov8n-pose.onnx` | Exported pose model |
 | `ONNX_MODEL_PATH` | `backend/violence_lstm.onnx` | Trained LSTM ONNX model |
 | `ONNX_INTRA_OP_THREADS` | `1` | ONNX Runtime CPU threads |
-| `MAX_UPLOAD_BYTES` | `524288000` | Maximum uploaded video size |
-| `JPEG_QUALITY` | `75` | WebSocket JPEG quality |
-| `PORT` | `7860` | FastAPI listen port |
+| `MAX_UPLOAD_BYTES` | `104857600` | Maximum uploaded video size |
+| `JPEG_QUALITY` | `70` | WebSocket JPEG quality |
+| `PORT` | `7860` | FastAPI listen port locally; Render supplies its port |
+| `VIOLENCE_THRESHOLD` | `0.75` | Strict classifier decision threshold (`probability > threshold`); requires three consecutive triggers; Render Blueprint overrides to `0.85` |
 
 ## Evidence and limitations
 
-The trained ONNX artifact was produced from 2,000 downloaded videos (1,000 per class), with a stratified 400-sequence test split. At the backend's `> 0.85` threshold, held-out precision/recall/F1 were 1.000/0.330/0.496; at `0.50`, they were 0.847/0.775/0.809. A single offline 66-frame clip ran at 15.89 FPS on an Intel Core i5-1135G7; this is not a live-site or broad performance benchmark. The checked-in `backend/data/benchmark_summary.json` and 22 older `incidents.jsonl` rows belong to the earlier velocity-heuristic prototype and are not LSTM results. See [paper.md](paper.md) for scope and limitations.
+The trained ONNX artifact was produced from 2,000 downloaded videos (1,000 per class), with a stratified 400-sequence test split. Raw, per-sequence measurements at thresholds `> 0.85`, `> 0.65`, and `0.50` yielded held-out precision/recall/F1 of 1.000/0.330/0.496, 0.944/0.670/0.784, and 0.847/0.775/0.809, respectively. These historical threshold-only results do not evaluate the current `> 0.75` threshold combined with the three-consecutive-result debounce. A single offline 66-frame clip ran at 15.89 FPS on an Intel Core i5-1135G7; this is not a live-site or broad performance benchmark. Historical logs and synthetic benchmark measurements belong to the earlier velocity-heuristic prototype and are not LSTM results. See [paper/paper.md](paper/paper.md) for scope and limitations.
 
 The implementation selects the highest-confidence person independently in each frame and represents missing poses with zero coordinates. Multiple-person identity switches, camera motion, occlusion, non-violent high-motion activity, and threshold calibration require testing on representative labeled footage before operational use.
 
-## Hugging Face Spaces deployment
+## Render deployment
 
-The root `Dockerfile` builds the static frontend and backend image for port 7860. Train and place `backend/violence_lstm.onnx` in the repository first. Then configure `HF_TOKEN` in your shell and deploy:
+The root `render.yaml` defines a Docker web service using the included `Dockerfile`. Both model files must be present:
 
-```bash
-HF_TOKEN=hf_... ./deploy.sh username/space-name
+```text
+backend/violence_lstm.onnx
+backend/yolov8n-pose.onnx
 ```
 
-On PowerShell, set `$env:HF_TOKEN` before invoking the script from Git Bash or WSL. The deployment helper creates or updates a Docker Space and excludes Kaggle credentials, downloaded datasets, NumPy training arrays, and local pose checkpoints.
+Push the repository to GitHub, then in Render choose **New + → Blueprint** and connect the repository. Render reads `render.yaml`. The service binds to Render's `$PORT`, starts idle without a camera, and accepts uploaded MP4 or RTSP sources. The free instance has limited CPU and ephemeral storage: the Blueprint keeps its 8 FPS setting, may sleep after inactivity, and loses local SQLite logs and uploaded files after restart or redeploy.
+
+To test locally:
+
+```bash
+docker build -t violence-detection-edge .
+docker run --rm -p 10000:10000 violence-detection-edge
+```
 
 ## Research report
 
-See [paper.md](paper.md) for the IEEE-style engineering report, including the distinction between historical prototype logs and unmeasured LSTM performance.
+See [paper/paper.md](paper/paper.md) for the IEEE-style engineering report, including the distinction between historical prototype logs and unmeasured LSTM performance.

@@ -1,0 +1,10 @@
+-r requirements.txt
+
+# Offline dataset preparation and model training/export only
+ultralytics>=8.3.0
+torch>=2.2.0,<3.0.0
+scikit-learn>=1.4.0
+onnx>=1.16.0
+onnxslim>=0.1.82
+kaggle>=1.6.0
+huggingface_hub>=0.28.0

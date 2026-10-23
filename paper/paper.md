@@ -7,9 +7,9 @@
 
 ## Abstract
 
-This work specifies an edge-oriented violence classification system that combines YOLOv8 pose estimation with a compact, single-layer LSTM. Each frame contributes the normalized x/y coordinates of 17 COCO body keypoints. A rolling 30-frame window forms a 30-by-34 input sequence. The classifier returns a fighting probability; the service raises an event when that probability exceeds 0.85. A bounded multiprocessing queue connects webcam, RTSP, or paced local-video ingestion to inference.
+This work describes an edge-oriented violence classification system that combines YOLOv8 pose estimation with a compact, single-layer LSTM. Each frame contributes the normalized x/y coordinates of 17 COCO body keypoints. A rolling 30-frame window forms a 30-by-34 input sequence. The classifier returns a fighting probability; the local-edge service requires three consecutive results above 0.75 before raising an event. The Render Blueprint retains separate 8 FPS ingestion and 0.85 probability-threshold settings for its constrained CPU tier. ONNX Runtime performs both pose and temporal inference. An asyncio producer-consumer path bounds queued frames to 30 and caps local ingestion at 15 FPS.
 
-The pipeline was run on 2,000 unique videos from the downloaded dataset, producing balanced 30-frame pose sequences and a trained ONNX artifact. On a stratified 400-video test split, the configured `> 0.85` threshold yielded 1.00 precision, 0.33 recall, and 0.496 F1; at 0.50, the corresponding scores were 0.847, 0.775, and 0.809. A 66-frame offline CPU smoke test on one non-violent clip ran at 15.89 FPS, with 57.00 ms mean pose-plus-classifier time. These are limited dataset and single-clip measurements, not external or live-site validation. The 22 older local incident records predate the LSTM and contain no FPS or inference-latency fields.
+The pipeline was run on 2,000 unique videos from the downloaded dataset, producing balanced 30-frame pose sequences and a trained ONNX artifact. On a stratified 400-video test split, the local `> 0.65` threshold yielded 0.944 precision, 0.670 recall, and 0.784 F1; the prior `> 0.85` threshold yielded 1.000 precision, 0.330 recall, and 0.496 F1. A 66-frame offline CPU smoke test on one non-violent clip ran at 15.89 FPS, with 57.00 ms mean pose-plus-classifier time. These are limited dataset and single-clip measurements, not external or live-site validation. The 22 older local incident records predate the LSTM and contain no FPS or inference-latency fields.
 
 **Index Terms—** violence detection, human pose estimation, LSTM, ONNX Runtime, edge inference, video analytics.
 
@@ -23,21 +23,21 @@ This project uses a YOLOv8 pose model for per-frame keypoints and a 64-unit LSTM
 
 ### A. Input Sources and Frame Timing
 
-The ingestion process accepts local webcam indices, RTSP/RTSPS URLs, and local video paths. Webcam capture uses OpenCV; network streams and files use the FFmpeg-backed producer. A one-slot multiprocessing queue discards stale frames when the consumer falls behind, limiting queue growth.
+The ingestion process accepts local webcam indices, RTSP/RTSPS URLs, and local video paths. OpenCV reads and resizes frames before they enter a bounded `asyncio.Queue(maxsize=30)`. When full, the queue drops the oldest pending frame. Local ingestion defaults to 15 FPS; Render is configured separately at 8 FPS. Inference runs off the event loop on a worker thread.
 
-Local recordings are not decoded as fast as the hardware permits. The producer targets 30 frames per second and sleeps for the remaining frame interval after accounting for read and queue time. This preserves approximately real-time spacing for the temporal sequence. It cannot reconstruct original capture timing when the source has a variable frame rate or unreliable metadata.
+Local recordings are not decoded as fast as the hardware permits. The producer targets up to 15 frames per second and sleeps for the remaining frame interval after accounting for read and queue time. This cap is aligned with the approximately 15 FPS measured in one offline CPU smoke test, not a guarantee of sustained inference throughput. If inference falls behind, pending frames are discarded after the 30-frame buffer fills. This cannot reconstruct original capture timing when a source has a variable frame rate or unreliable metadata.
 
 ### B. Pose Sequence and Classifier
 
-For each frame, YOLOv8-Pose estimates 17 keypoints at `imgsz=320` in both dataset preparation and online inference. The implementation selects the person with the highest detection confidence, scales x and y coordinates to the range [0, 1], and flattens them into 34 features. Missing detections are represented by zeros. The latest 30 feature vectors form the classifier input:
+For each frame, the exported YOLOv8-Pose ONNX model estimates 17 keypoints using a 320-by-320 input. The backend decodes its 56-by-2,100 output, applies confidence filtering and non-maximum suppression, then selects the highest-confidence person. Keypoints are mapped through the letterbox transform, scaled to [0, 1], and flattened into 34 features. Missing detections are represented by zeros. The latest 30 feature vectors form the classifier input:
 
 $$
 X_t \in \mathbb{R}^{30 \times 34}.
 $$
 
-The recurrent layer is a one-layer, batch-first LSTM with input dimension 34 and hidden dimension 64. Its final time-step representation passes through a linear layer and sigmoid to produce a probability $p_t$. The service sets `is_violence` when $p_t > 0.85$. This threshold is a configured operating point, not a threshold selected from a completed validation study.
+The recurrent layer is a one-layer, batch-first LSTM with input dimension 34 and hidden dimension 64. Its final time-step representation passes through a linear layer and sigmoid to produce a probability $p_t$. The local-edge service uses a default threshold of 0.75 and sets `is_violence` only after three consecutive processed frames exceed it; a below-threshold result resets the counter. The Render Blueprint retains its stricter `VIOLENCE_THRESHOLD=0.85` override. This temporal debounce is intended to suppress isolated spikes; its effect on held-out precision and recall has not yet been measured.
 
-Training uses binary cross-entropy with logits, Adam, and a stratified 80/20 train/test split. The training script reports held-out precision, recall, and F1 at the same strict $p_t > 0.85$ operating threshold used by the service, then exports a probability-output ONNX model.
+Training uses binary cross-entropy with logits, Adam, and a stratified 80/20 train/test split. The training script reports held-out precision, recall, and F1 at the same strict $p_t > 0.65$ local-edge operating threshold used by the service, then exports a probability-output ONNX model.
 
 ### C. Persistence and User Interface
 
@@ -55,7 +55,7 @@ Training used 30 epochs, batch size 64, seed 42, and CPU-only PyTorch on an Inte
 
 ## IV. Local Logs and Benchmark Results
 
-The local `backend/data/incidents.jsonl` was parsed at authoring time. It contains 22 records in the pre-LSTM velocity schema:
+The local `backend/data/incidents.jsonl` was parsed at authoring time before release cleanup. It contained 22 records in the pre-LSTM velocity schema; runtime log files are not included in the production repository:
 
 | Severity reported by the earlier logger | Records |
 |---|---:|
@@ -66,25 +66,26 @@ The local `backend/data/incidents.jsonl` was parsed at authoring time. It contai
 
 None of those records contains an FPS or inference-latency field. They were written by the earlier pose-velocity implementation, not by the ONNX LSTM. The records describe classifier outputs and are not verified incident labels.
 
-The checked-in `backend/data/benchmark_summary.json` is also from the earlier implementation. Its 130-frame controlled benchmark reports 65.43 ms mean pose latency, 0.095 ms heuristic latency, 66.95 ms mean pipeline latency, 74.31 ms p95 latency, and 14.9 FPS. The associated benchmark harness feeds synthetic keypoint sequences to the velocity classifier. These values must not be attributed to the LSTM, nor described as real-world violence accuracy.
+The earlier implementation's 130-frame controlled benchmark reported 65.43 ms mean pose latency, 0.095 ms heuristic latency, 66.95 ms mean pipeline latency, 74.31 ms p95 latency, and 14.9 FPS. The harness fed synthetic keypoint sequences to the velocity classifier. These historical values are retained here for context only; they must not be attributed to the LSTM or described as real-world violence accuracy. The benchmark files are excluded from the production repository.
 
-The trained LSTM results below use its held-out split and the same `> 0.85` threshold as the backend. The 0.50 row is included to show the precision/recall trade-off; it is not the deployed setting.
+The trained LSTM results below use its held-out split and report raw per-sequence threshold comparisons only. They do not evaluate the new local-edge `> 0.75` threshold with three-result debounce; the earlier `> 0.85` and reference 0.50 rows provide context for the measured threshold trade-off.
 
 | Pose-LSTM test or runtime measurement | Result |
 |---|---:|
 | Unique videos used | 2,000 (1,000 per class) |
 | Held-out sequences | 400 (200 per class) |
-| Precision / recall / F1 at `> 0.85` | 1.000 / 0.330 / 0.496 |
+| Precision / recall / F1 at raw `> 0.65` (no debounce) | 0.944 / 0.670 / 0.784 |
+| Precision / recall / F1 at raw `> 0.85` (no debounce) | 1.000 / 0.330 / 0.496 |
 | Precision / recall / F1 at `>= 0.50` | 0.847 / 0.775 / 0.809 |
 | Offline clip runtime | 66 frames, `NV_1.mp4`; 15.89 wall-clock FPS |
 | Mean / p95 pose-plus-ONNX call time | 57.00 / 53.49 ms |
 | Historical incident rows with FPS/latency | 0 of 22 |
 
-The runtime check used direct frame-by-frame inference on one downloaded non-violent clip, without ingestion, WebSocket, or frontend overhead. Its mean includes a slow first-frame outlier, which is why the p95 is lower than the mean. Throughput was below the configured 30 FPS target on this CPU. The test metrics come from one split of one dataset; they do not establish performance on other cameras, scenes, or populations. The historical velocity-heuristic rows and 130-frame synthetic-motion benchmark remain separate from these LSTM measurements.
+Threshold metrics are computed from the existing ONNX classifier on the same deterministic held-out split: at `> 0.65`, confusion counts are 192 true negatives, 8 false positives, 66 false negatives, and 134 true positives. Lowering the threshold raises recall by 0.34 over 0.85, while precision falls from 1.000 to 0.944. The runtime check used direct frame-by-frame inference on one downloaded non-violent clip, without ingestion, WebSocket, or frontend overhead. Its mean includes a slow first-frame outlier, which is why the p95 is lower than the mean. Direct inference throughput was 15.89 FPS on this CPU; local capture is now capped at 15 FPS to reduce queue buildup, but this does not guarantee matching sustained inference throughput. The current local `> 0.75` threshold and three-result debounce have not been evaluated on the held-out split. Render remains configured at 8 FPS. The test metrics come from one split of one dataset; they do not establish performance on other cameras, scenes, or populations. The historical velocity-heuristic rows and 130-frame synthetic-motion benchmark remain separate from these LSTM measurements.
 
 ## V. Deployment and Limitations
 
-The Docker image exposes port 7860 for Hugging Face Spaces. The ONNX model must be generated at `backend/violence_lstm.onnx` before building the production image. The backend checks for that artifact during startup and reports a clear error if it is absent.
+The Render Docker service binds to the platform-provided port (default 10000) and starts without a camera source. Both `backend/yolov8n-pose.onnx` and `backend/violence_lstm.onnx` must be present in the image. Runtime dependencies exclude PyTorch and Ultralytics; training-only packages are listed separately. The free service has limited CPU and ephemeral local storage, so its incident database and uploaded files are not durable across restarts.
 
 The current feature vector contains coordinates but not keypoint confidence, body scale, or explicit person tracking. Selecting the highest-confidence person independently in each frame may switch identities when several people are present. Zero-filling missing poses also creates a signal the model may not see often enough during training. These choices need targeted validation and may need to change before a safety-critical deployment.
 
@@ -92,7 +93,7 @@ The dataset split and reported metrics should be checked for subject/camera leak
 
 ## VI. Conclusion
 
-The repository now defines a complete route from Kaggle video to normalized pose sequences, a compact LSTM, ONNX inference, hybrid ingestion, event logging, and a live dashboard. The implementation is reproducible in structure, but the model has not yet been trained in this environment. No LSTM performance number is reported until data access, training, and target-device measurement have been completed.
+The repository defines a route from Kaggle video to normalized pose sequences, a compact LSTM, two-model ONNX inference, hybrid ingestion, event logging, and a live dashboard. The low-resource runtime avoids PyTorch and Ultralytics; Render bounds ingestion to 8 FPS and local ingestion to 15 FPS. Dataset and single-clip results are reported with their limitations; this model is not yet independently validated or characterized on Render hardware.
 
 ## References
 
