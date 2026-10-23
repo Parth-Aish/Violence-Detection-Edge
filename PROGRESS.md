@@ -97,7 +97,7 @@ The items below track the requested Pose-LSTM implementation. Existing project c
 
 ## Status Legend
 
-**Execution status:** Dataset preparation, LSTM training, ONNX export, actual-clip inference, and a full FastAPI/WebSocket smoke test are complete. Held-out scores at the backend's `> 0.85` threshold are precision 1.000, recall 0.330, and F1 0.496; reference scores at 0.50 are 0.847, 0.775, and 0.809. A single offline 66-frame clip measured 15.89 FPS on this CPU, below the 30 FPS target. Docker is not installed and Hugging Face authentication is not configured, so image build and Space deployment remain blocked.
+**Execution status:** Dataset preparation, LSTM training, ONNX export, actual-clip inference, and a full FastAPI/WebSocket smoke test are complete. Held-out scores at the backend's `> 0.85` threshold are precision 1.000, recall 0.330, and F1 0.496; reference scores at 0.50 are 0.847, 0.775, and 0.809. A single offline 66-frame clip measured 15.89 FPS on this CPU, below the 30 FPS target. Docker is not installed and Hugging Face returned HTTP 402 for a free Docker Space. GitHub commit `8670204` is created locally, but pushing to the configured repository is pending GitHub CLI/Git Credential Manager authentication.
 
 **Runtime note:** The updated FastAPI backend is running at `http://localhost:7860` on a looping local non-violent demo clip, and the Next.js UI is running at `http://localhost:3000`. `/api/health` reports the trained model loaded, and `/ws/stream` delivered JPEG frames with a boolean `is_violence` field.
 
