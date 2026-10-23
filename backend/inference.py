@@ -49,6 +49,7 @@ class ViolencePrediction:
     timestamp: float
     inference_ms: float
     fps: float
+    keypoints: Optional[np.ndarray] = None
 
 
 class PoseLSTMDetector:
@@ -315,6 +316,7 @@ class PoseLSTMDetector:
             timestamp=now,
             inference_ms=(time.perf_counter() - started) * 1000.0,
             fps=self._fps,
+            keypoints=pose.reshape(KEYPOINT_COUNT, 2).copy(),
         )
 
     def reset(self) -> None:

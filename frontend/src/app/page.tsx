@@ -20,7 +20,7 @@ interface Stats {
   total: number;
 }
 
-type SourceMode = "webcam" | "upload" | "rtsp";
+type SourceMode = "idle" | "webcam" | "upload" | "rtsp";
 type ConnectionStatus = "connecting" | "connected" | "disconnected";
 
 const API_URL =
@@ -48,14 +48,37 @@ export default function DashboardPage() {
   const [fps, setFps] = useState(0);
   const [latency, setLatency] = useState(0);
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
-  const [sourceMode, setSourceMode] = useState<SourceMode>("webcam");
+  const [sourceMode, setSourceMode] = useState<SourceMode>("idle");
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [stats, setStats] = useState<Stats>(EMPTY_STATS);
   const [rtspUrl, setRtspUrl] = useState("");
   const [busy, setBusy] = useState(false);
+  const [cameraStarting, setCameraStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filename, setFilename] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const captureTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const clientFramePendingRef = useRef(false);
+  const cameraRequestPendingRef = useRef(false);
+
+  function stopBrowserCamera(stopServerStream = false) {
+    if (captureTimerRef.current !== null) {
+      clearInterval(captureTimerRef.current);
+      captureTimerRef.current = null;
+    }
+    const socket = socketRef.current;
+    if (stopServerStream && socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ action: "stop_server_stream" }));
+    }
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+    clientFramePendingRef.current = false;
+  }
 
   useEffect(() => {
     let stopped = false;
@@ -82,26 +105,35 @@ export default function DashboardPage() {
       if (stopped) return;
       setStatus("connecting");
       currentSocket = new WebSocket(WS_URL);
-      currentSocket.onopen = () => setStatus("connected");
+      currentSocket.onopen = () => {
+        socketRef.current = currentSocket ?? null;
+        setStatus("connected");
+      };
       currentSocket.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data);
           if (message.type === "frame") {
+            clientFramePendingRef.current = false;
             setFrame(message.data);
             setIsViolence(message.is_violence === true);
             setProbability(Number(message.probability) || 0);
             setFps(Number(message.fps) || 0);
-            setLatency(Number(message.inference_ms) || 0);
+            setLatency(Number(message.latency_ms ?? message.inference_ms) || 0);
           } else if (message.type === "incident") {
             const incident = message.data as Incident;
             setIncidents((previous) => [incident, ...previous].slice(0, 100));
             void refresh();
+          } else if (message.type === "error") {
+            clientFramePendingRef.current = false;
+            setError(String(message.detail ?? "The video frame could not be processed."));
           }
         } catch {
           setError("Received an unreadable message from the video stream.");
         }
       };
       currentSocket.onclose = () => {
+        if (socketRef.current === currentSocket) socketRef.current = null;
+        clientFramePendingRef.current = false;
         setStatus("disconnected");
         if (!stopped) reconnectTimer = setTimeout(connect, 3000);
       };
@@ -115,6 +147,8 @@ export default function DashboardPage() {
       stopped = true;
       if (connectTimer) clearTimeout(connectTimer);
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      stopBrowserCamera();
+      socketRef.current = null;
       currentSocket?.close();
     };
   }, []);
@@ -141,18 +175,91 @@ export default function DashboardPage() {
   }
 
   async function selectWebcam() {
-    if (await switchSource("/source/webcam", { method: "POST" })) {
+    if (mediaStreamRef.current || cameraRequestPendingRef.current) return;
+    cameraRequestPendingRef.current = true;
+    setCameraStarting(true);
+    try {
+      if (!(await switchSource("/api/source/webcam", { method: "POST" }))) return;
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setError("Browser camera access is unavailable. Use HTTPS or a supported browser, then try again.");
+        return;
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: 480,
+          height: 360,
+          facingMode: "user",
+        },
+        audio: false,
+      });
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      if (!video || !canvas) {
+        stream.getTracks().forEach((track) => track.stop());
+        throw new Error("The browser video capture surface is unavailable.");
+      }
+      mediaStreamRef.current = stream;
+      video.srcObject = stream;
+      await video.play();
+      clientFramePendingRef.current = false;
+      captureTimerRef.current = setInterval(() => {
+        const socket = socketRef.current;
+        if (
+          !videoRef.current ||
+          !canvasRef.current ||
+          !mediaStreamRef.current ||
+          videoRef.current.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+          clientFramePendingRef.current ||
+          socket?.readyState !== WebSocket.OPEN ||
+          socket.bufferedAmount > 1024 * 1024
+        ) {
+          return;
+        }
+        const context = canvasRef.current.getContext("2d");
+        if (!context) {
+          setError("Could not initialize browser camera frame capture.");
+          stopBrowserCamera();
+          return;
+        }
+        context.drawImage(videoRef.current, 0, 0, canvasRef.current.width, canvasRef.current.height);
+        const jpeg = canvasRef.current.toDataURL("image/jpeg", 0.6);
+        const data = jpeg.slice("data:image/jpeg;base64,".length);
+        try {
+          clientFramePendingRef.current = true;
+          socket.send(JSON.stringify({ type: "client_frame", data }));
+        } catch {
+          clientFramePendingRef.current = false;
+          setError("Could not send camera frames to the inference service.");
+        }
+      }, 100);
       setSourceMode("webcam");
       setFilename(null);
+      setError(null);
+    } catch (cause) {
+      stopBrowserCamera();
+      const detail =
+        cause instanceof DOMException && cause.name === "NotAllowedError"
+          ? "Camera permission was denied. Allow camera access in your browser and try again."
+          : cause instanceof DOMException && cause.name === "NotFoundError"
+            ? "No camera was found on this device."
+            : cause instanceof Error
+              ? cause.message
+              : "Could not start the browser camera.";
+      setError(detail);
+    } finally {
+      cameraRequestPendingRef.current = false;
+      setCameraStarting(false);
     }
   }
 
   async function selectRtsp() {
+    if (cameraStarting) return;
     const input = rtspUrl.trim();
     if (!/^rtsps?:\/\/\S+$/i.test(input)) {
       setError("Enter a valid rtsp:// or rtsps:// stream URL.");
       return;
     }
+    stopBrowserCamera();
     if (
       await switchSource("/source/rtsp", {
         method: "POST",
@@ -166,6 +273,7 @@ export default function DashboardPage() {
   }
 
   async function uploadVideo(file?: File) {
+    if (cameraStarting) return;
     if (!file) return;
     if (!file.name.toLowerCase().endsWith(".mp4")) {
       setError("Choose an MP4 video file.");
@@ -173,6 +281,7 @@ export default function DashboardPage() {
     }
     const body = new FormData();
     body.append("file", file);
+    stopBrowserCamera();
     if (await switchSource("/upload", { method: "POST", body })) {
       setSourceMode("upload");
       setFilename(file.name);
@@ -185,6 +294,8 @@ export default function DashboardPage() {
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#08090b] text-white">
+      <video ref={videoRef} autoPlay playsInline muted className="hidden" />
+      <canvas ref={canvasRef} width={480} height={360} className="hidden" />
       <header className="mx-4 mt-4 flex items-center justify-between rounded-2xl border border-white/[0.08] bg-white/[0.04] px-5 py-4 shadow-xl shadow-black/20 backdrop-blur-2xl md:mx-8">
         <div>
           <p className="text-[10px] font-semibold uppercase tracking-[0.24em] text-indigo-300">
@@ -240,7 +351,7 @@ export default function DashboardPage() {
             )}
 
             <div className="absolute left-4 top-4 rounded-full border border-white/10 bg-black/50 px-3 py-1.5 text-[10px] font-medium uppercase tracking-widest text-white/70 backdrop-blur-lg">
-              {sourceMode === "webcam" ? "Local webcam" : sourceMode === "rtsp" ? "RTSP stream" : filename ?? "Uploaded video"}
+              {sourceMode === "webcam" ? "Browser webcam" : sourceMode === "rtsp" ? "RTSP stream" : sourceMode === "idle" ? "No source selected" : filename ?? "Uploaded video"}
             </div>
             {frame && (
               <div
@@ -266,19 +377,29 @@ export default function DashboardPage() {
             <div className="flex flex-wrap gap-2">
               <button
                 type="button"
-                disabled={busy}
+                disabled={busy || cameraStarting}
                 aria-pressed={sourceMode === "webcam"}
-                onClick={selectWebcam}
+                onClick={() => {
+                  if (sourceMode === "webcam" && mediaStreamRef.current) {
+                    stopBrowserCamera(true);
+                    setSourceMode("idle");
+                    setFrame(null);
+                    setIsViolence(false);
+                    setProbability(0);
+                  } else {
+                    void selectWebcam();
+                  }
+                }}
                 className={`rounded-xl border px-4 py-2.5 text-xs font-semibold transition disabled:opacity-50 ${
                   sourceMode === "webcam" ? "border-white/20 bg-white text-zinc-950" :
                     "border-white/10 bg-white/[0.04] text-zinc-300 hover:bg-white/10"
                 }`}
               >
-                Webcam
+                {sourceMode === "webcam" ? "Stop Webcam" : "Use Webcam"}
               </button>
               <button
                 type="button"
-                disabled={busy}
+                disabled={busy || cameraStarting}
                 aria-pressed={sourceMode === "upload"}
                 onClick={() => fileInput.current?.click()}
                 onDragOver={(event) => event.preventDefault()}
@@ -291,7 +412,7 @@ export default function DashboardPage() {
                     "border-white/10 bg-white/[0.04] text-zinc-300 hover:bg-white/10"
                 }`}
               >
-                {busy && sourceMode === "upload" ? "Uploading…" : "Upload Video"}
+                {cameraStarting ? "Starting webcam…" : busy && sourceMode === "upload" ? "Uploading…" : "Upload Video"}
               </button>
               <input
                 ref={fileInput}
@@ -310,7 +431,7 @@ export default function DashboardPage() {
               />
               <button
                 type="button"
-                disabled={busy}
+                disabled={busy || cameraStarting}
                 aria-pressed={sourceMode === "rtsp"}
                 onClick={selectRtsp}
                 className="rounded-xl border border-white/10 bg-white/[0.04] px-4 py-2.5 text-xs font-semibold text-zinc-300 transition hover:bg-white/10 disabled:opacity-50"

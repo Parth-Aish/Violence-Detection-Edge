@@ -23,7 +23,7 @@ This project uses a YOLOv8 pose model for per-frame keypoints and a 64-unit LSTM
 
 ### A. Input Sources and Frame Timing
 
-The ingestion process accepts local webcam indices, RTSP/RTSPS URLs, and local video paths. OpenCV reads and resizes frames before they enter a bounded `asyncio.Queue(maxsize=30)`. When full, the queue drops the oldest pending frame. Local and Render ingestion are capped at 15 FPS. Inference runs off the event loop on a worker thread.
+The service accepts browser webcam frames, RTSP/RTSPS URLs, and local video paths. The browser uses `getUserMedia` and streams JPEG frames through `/ws/stream`; the cloud backend never tries to open a local hardware webcam. RTSP and uploaded-video frames are read and resized before entering a bounded `asyncio.Queue(maxsize=30)`. When full, that server-ingestion queue drops the oldest pending frame. Local and Render ingestion are capped at 15 FPS. Inference runs off the event loop on a worker thread.
 
 Local recordings are not decoded as fast as the hardware permits. The producer targets up to 15 frames per second and sleeps for the remaining frame interval after accounting for read and queue time. This cap is aligned with the approximately 15 FPS measured in one offline CPU smoke test, not a guarantee of sustained inference throughput. If inference falls behind, pending frames are discarded after the 30-frame buffer fills. This cannot reconstruct original capture timing when a source has a variable frame rate or unreliable metadata.
 
@@ -41,7 +41,7 @@ Training uses binary cross-entropy with logits, Adam, and a stratified 80/20 tra
 
 ### C. Persistence and User Interface
 
-FastAPI manages ingestion, inference, upload handling, incident persistence, and `/ws/stream`. WebSocket frame messages contain a base64 JPEG, `is_violence`, probability, FPS, and inference time. Preview frames are resized to at most 480 pixels wide and encoded at JPEG quality 60 to reduce transfer size. The frontend offers webcam, MP4 upload, and RTSP controls. The status badge changes from green SAFE to a red violence alert when the message flag is true.
+FastAPI manages ingestion, inference, upload handling, incident persistence, and `/ws/stream`. For browser capture, the WebSocket reader runs alongside a frame processor. A one-frame queue replaces stale waiting images, while each response contains an annotated base64 JPEG, `is_violence`, probability, FPS, and inference latency. Preview frames are resized to at most 480 pixels wide and encoded at JPEG quality 60 to reduce transfer size. The frontend offers webcam, MP4 upload, and RTSP controls. It waits for an inference response before sending the next webcam frame, and stops all camera tracks when the source changes. The status badge changes from green SAFE to a red violence alert when the message flag is true.
 
 Positive predictions are written to SQLite and JSON Lines with timestamps, severity, probability, confidence, FPS, and measured inference latency. A cooldown limits repeated log rows during a continuous event. Uploads are size-limited, stored temporarily, and played once; switching sources resets the LSTM history.
 

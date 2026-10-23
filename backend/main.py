@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 import logging
 import os
@@ -46,6 +47,8 @@ FRAME_FPS = max(
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "60"))
 MAX_STREAM_WIDTH = 480
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
+MAX_CLIENT_FRAME_BYTES = 5 * 1024 * 1024
+MAX_CLIENT_FRAME_PIXELS = 1920 * 1080
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
@@ -65,6 +68,7 @@ _active_source_type = "idle"
 _source_generation = 0
 
 _ws_clients: set[WebSocket] = set()
+_ws_send_locks: dict[WebSocket, asyncio.Lock] = {}
 _ws_lock = asyncio.Lock()
 _source_lock = asyncio.Lock()
 
@@ -146,6 +150,23 @@ async def _swap_source(
         log.info("Video source changed to %s", _active_source_type)
 
 
+async def _use_browser_webcam(source_type: str = "webcam") -> None:
+    global _frame_queue, _active_upload_path, _active_source_type, _source_generation
+
+    async with _source_lock:
+        old_upload_path = _active_upload_path
+        await _stop_producer()
+        _frame_queue = create_frame_queue()
+        _active_upload_path = None
+        _active_source_type = source_type
+        _source_generation += 1
+        if _classifier is not None:
+            _classifier.reset()
+        if old_upload_path is not None:
+            old_upload_path.unlink(missing_ok=True)
+        log.info("Stopped server ingestion; waiting for browser webcam frames")
+
+
 def _report_producer_error(task: asyncio.Task) -> None:
     if task.cancelled():
         return
@@ -164,13 +185,206 @@ async def _broadcast(payload: dict) -> None:
     async with _ws_lock:
         for websocket in tuple(_ws_clients):
             try:
-                await websocket.send_text(encoded)
+                await _send_websocket_text(websocket, encoded)
             except (WebSocketDisconnect, RuntimeError, OSError):
                 _ws_clients.discard(websocket)
 
 
+async def _send_websocket_text(websocket: WebSocket, message: str) -> None:
+    send_lock = _ws_send_locks.get(websocket)
+    if send_lock is None:
+        return
+    async with send_lock:
+        await websocket.send_text(message)
+
+
+def _decode_client_frame(encoded: str) -> Optional[np.ndarray]:
+    if len(encoded) > MAX_CLIENT_FRAME_BYTES * 4 // 3 + 4:
+        raise ValueError("Client frame exceeds the maximum allowed size.")
+    try:
+        jpeg = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("Client frame is not valid base64.") from exc
+    if len(jpeg) > MAX_CLIENT_FRAME_BYTES:
+        raise ValueError("Client frame exceeds the maximum allowed size.")
+    frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if frame is None or frame.size == 0:
+        raise ValueError("Client frame is not a valid JPEG image.")
+    if frame.shape[0] * frame.shape[1] > MAX_CLIENT_FRAME_PIXELS:
+        raise ValueError("Client frame dimensions exceed the maximum allowed size.")
+    return frame
+
+
+async def _receive_websocket_messages(
+    websocket: WebSocket, frame_queue: asyncio.Queue[tuple[np.ndarray, int]]
+) -> None:
+    while True:
+        message = await websocket.receive_text()
+        try:
+            payload = json.loads(message)
+        except json.JSONDecodeError:
+            await _send_websocket_text(
+                websocket, json.dumps({"type": "error", "detail": "Invalid JSON"})
+            )
+            continue
+        if not isinstance(payload, dict):
+            await _send_websocket_text(
+                websocket, json.dumps({"type": "error", "detail": "Invalid message"})
+            )
+            continue
+        if payload.get("action") == "stop_server_stream":
+            if _classifier is None:
+                await _send_websocket_text(
+                    websocket,
+                    json.dumps(
+                        {"type": "error", "detail": "Inference model is not loaded."}
+                    ),
+                )
+                continue
+            await _use_browser_webcam(source_type="idle")
+            while True:
+                try:
+                    frame_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            await _send_websocket_text(
+                websocket,
+                json.dumps({"type": "source", "source": "idle", "status": "stopped"}),
+            )
+            continue
+        if payload.get("type") == "ping":
+            await _send_websocket_text(
+                websocket, json.dumps({"type": "pong"})
+            )
+            continue
+        if payload.get("type") != "client_frame":
+            continue
+        if _active_source_type != "webcam":
+            await _send_websocket_text(
+                websocket,
+                json.dumps(
+                    {
+                        "type": "error",
+                        "detail": "Select browser webcam mode before sending camera frames.",
+                    }
+                ),
+            )
+            continue
+        encoded = payload.get("data")
+        if not isinstance(encoded, str):
+            await _send_websocket_text(
+                websocket,
+                json.dumps({"type": "error", "detail": "Frame data must be a base64 string."}),
+            )
+            continue
+        try:
+            frame = await asyncio.to_thread(_decode_client_frame, encoded)
+        except ValueError as exc:
+            await _send_websocket_text(
+                websocket, json.dumps({"type": "error", "detail": str(exc)})
+            )
+            continue
+        try:
+            frame_queue.put_nowait((frame, _source_generation))
+        except asyncio.QueueFull:
+            try:
+                frame_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            frame_queue.put_nowait((frame, _source_generation))
+
+
+async def _process_websocket_frames(
+    websocket: WebSocket, frame_queue: asyncio.Queue[tuple[np.ndarray, int]]
+) -> None:
+    frame_count = 0
+    rate_started = time.monotonic()
+    measured_fps = 0.0
+    while True:
+        frame, generation = await frame_queue.get()
+        if generation != _source_generation or _active_source_type != "webcam":
+            continue
+        if _classifier is None:
+            await _send_websocket_text(
+                websocket,
+                json.dumps({"type": "error", "detail": "Inference model is not loaded."}),
+            )
+            continue
+        try:
+            prediction = await asyncio.to_thread(_classifier.process_frame, frame)
+            if generation != _source_generation or _active_source_type != "webcam":
+                continue
+            frame_count += 1
+            elapsed = time.monotonic() - rate_started
+            if elapsed >= 1.0:
+                measured_fps = frame_count / elapsed
+                frame_count = 0
+                rate_started = time.monotonic()
+            if prediction.is_fighting and _incident_logger is not None:
+                record = await asyncio.to_thread(
+                    _incident_logger.log_prediction, prediction
+                )
+                if record:
+                    await _broadcast({"type": "incident", "data": record})
+
+            await _send_websocket_text(
+                websocket,
+                json.dumps(
+                    {
+                        "type": "frame",
+                        "data": _jpeg_base64(_annotate_frame(frame, prediction)),
+                        "is_violence": prediction.is_fighting,
+                        "probability": prediction.probability,
+                        "severity": prediction.severity.name,
+                        "fps": measured_fps or prediction.fps,
+                        "inference_ms": prediction.inference_ms,
+                        "latency_ms": prediction.inference_ms,
+                        "timestamp": prediction.timestamp,
+                    }
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Client-frame inference or response failed.")
+            await _send_websocket_text(
+                websocket,
+                json.dumps({"type": "error", "detail": "Could not process client frame."}),
+            )
+
+
 def _annotate_frame(frame: np.ndarray, prediction: ViolencePrediction) -> np.ndarray:
     annotated = frame.copy()
+    if prediction.keypoints is not None and prediction.bbox is not None:
+        height, width = annotated.shape[:2]
+        points = np.asarray(prediction.keypoints).reshape(-1, 2)
+        valid = np.any(points > 0.0, axis=1)
+        pixel_points = np.column_stack(
+            (
+                np.rint(points[:, 0] * width),
+                np.rint(points[:, 1] * height),
+            )
+        ).astype(np.int32)
+        color = (0, 0, 255) if prediction.is_fighting else (40, 180, 90)
+        for start, end in (
+            (0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9),
+            (6, 8), (8, 10), (5, 11), (6, 12), (11, 12), (11, 13),
+            (13, 15), (12, 14), (14, 16),
+        ):
+            if valid[start] and valid[end]:
+                cv2.line(
+                    annotated,
+                    tuple(pixel_points[start]),
+                    tuple(pixel_points[end]),
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
+        for index, point in enumerate(pixel_points):
+            if valid[index]:
+                cv2.circle(
+                    annotated, tuple(point), 3, (255, 190, 70), -1, cv2.LINE_AA
+                )
     if prediction.bbox is not None:
         x1, y1, x2, y2 = (int(value) for value in prediction.bbox)
         color = (0, 0, 255) if prediction.is_fighting else (40, 180, 90)
@@ -338,14 +552,12 @@ async def health_check() -> dict:
     }
 
 
+@app.post("/api/source/webcam")
 @app.post("/source/webcam")
 async def use_webcam() -> dict:
     if _classifier is None:
         raise HTTPException(status_code=503, detail="Inference model is not loaded.")
-    try:
-        await _swap_source("0")
-    except (OSError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await _use_browser_webcam()
     return {"status": "ok", "source": "webcam"}
 
 
@@ -429,23 +641,35 @@ async def get_stats(hours: float = Query(default=24.0, ge=0.1, le=720)) -> dict:
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket) -> None:
     await websocket.accept()
+    frame_queue: asyncio.Queue[tuple[np.ndarray, int]] = asyncio.Queue(maxsize=1)
+    _ws_send_locks[websocket] = asyncio.Lock()
     async with _ws_lock:
         _ws_clients.add(websocket)
+    reader_task = asyncio.create_task(
+        _receive_websocket_messages(websocket, frame_queue),
+        name="websocket-frame-reader",
+    )
+    processor_task = asyncio.create_task(
+        _process_websocket_frames(websocket, frame_queue),
+        name="websocket-frame-inference",
+    )
     try:
-        while True:
-            message = await websocket.receive_text()
-            try:
-                if json.loads(message).get("type") == "ping":
-                    await websocket.send_text(json.dumps({"type": "pong"}))
-            except json.JSONDecodeError:
-                await websocket.send_text(
-                    json.dumps({"type": "error", "detail": "Invalid JSON"})
-                )
+        done, _ = await asyncio.wait(
+            {reader_task, processor_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            task.result()
     except WebSocketDisconnect:
         pass
     finally:
+        for task in (reader_task, processor_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(reader_task, processor_task, return_exceptions=True)
         async with _ws_lock:
             _ws_clients.discard(websocket)
+        _ws_send_locks.pop(websocket, None)
 
 
 frontend_dir = next(

@@ -2,7 +2,7 @@
 
 This repository contains a train-to-deploy video classification pipeline. An exported YOLOv8-Pose ONNX model extracts 17 body keypoints per frame; a single-layer, 64-unit LSTM ONNX model classifies 30-frame sequences of normalized x/y coordinates (34 features per frame). The production backend uses ONNX Runtime and OpenCV only for inference; it does not install PyTorch or Ultralytics. The backend uses a default probability threshold of `0.75` and emits a positive violence decision only after three consecutive above-threshold inference results.
 
-The project accepts webcam, RTSP/RTSPS, and MP4 sources. Local ingestion defaults to 15 FPS with an asyncio queue bounded to 30 frames. The classifier uses a default probability threshold of `0.75` and requires three consecutive above-threshold inference results before raising a violence alert. Pose inference runs every second frame by default, with intermediate keypoints extrapolated from observed motion. Render pins numerical-library and ONNX Runtime threads to one, uses a 15 FPS ingestion cap, `POSE_STRIDE=2`, and `VIOLENCE_THRESHOLD=0.85`. WebSocket previews are resized to at most 480 pixels wide and encoded as JPEG at quality 60. Incident timestamps, probability, severity, FPS, and inference latency are logged to SQLite and JSONL.
+The project accepts browser webcam, RTSP/RTSPS, and MP4 sources. The browser captures webcam frames through `getUserMedia` and sends them over `/ws/stream`; cloud servers do not attempt to open a local camera device. Local ingestion defaults to 15 FPS with an asyncio queue bounded to 30 frames. The classifier uses a default probability threshold of `0.75` and requires three consecutive above-threshold inference results before raising a violence alert. Pose inference runs every second frame by default, with intermediate keypoints extrapolated from observed motion. Render pins numerical-library and ONNX Runtime threads to one, uses a 15 FPS ingestion cap, `POSE_STRIDE=2`, and `VIOLENCE_THRESHOLD=0.85`. WebSocket previews are resized to at most 480 pixels wide and encoded as JPEG at quality 60. Incident timestamps, probability, severity, FPS, and inference latency are logged to SQLite and JSONL.
 
 ## Data and model workflow
 
@@ -76,7 +76,11 @@ Open `http://localhost:3000`. Use the Webcam control for camera index zero, uplo
 
 ## WebSocket and REST API
 
-`/ws/stream` broadcasts JSON frame events:
+`/ws/stream` accepts browser camera frames and returns annotated JSON frame events:
+
+```json
+{"type":"client_frame","data":"<base64 JPEG>"}
+```
 
 ```json
 {
@@ -85,11 +89,14 @@ Open `http://localhost:3000`. Use the Webcam control for camera index zero, uplo
   "is_violence": false,
   "probability": 0.12,
   "severity": "NONE",
-  "fps": 29.4,
+  "fps": 9.8,
   "inference_ms": 42.1,
+  "latency_ms": 42.1,
   "timestamp": 1792685082.84
 }
 ```
+
+The browser waits for each annotated response before sending its next camera frame, preventing a backlog on slower cloud instances. If frames are queued, the server retains only the newest waiting frame.
 
 Available endpoints:
 
@@ -98,10 +105,10 @@ Available endpoints:
 | `GET` | `/api/health` | Backend, ingestion, violence threshold, debounce, pose stride, and ONNX thread configuration |
 | `GET` | `/api/incidents` | Recent SQLite incidents |
 | `GET` | `/api/stats` | Severity counts |
-| `POST` | `/source/webcam` | Switch to local webcam index zero |
+| `POST` | `/api/source/webcam` (`/source/webcam` alias) | Stop server-side ingestion and prepare for browser webcam frames |
 | `POST` | `/source/rtsp` | Switch source; JSON body `{"source":"rtsp://..."}` |
 | `POST` | `/upload` | Upload an MP4 using multipart field `file` |
-| `WS` | `/ws/stream` | Annotated frames, probability, and violence flag |
+| `WS` | `/ws/stream` | Accept `client_frame` / `stop_server_stream` messages and return annotated predictions |
 
 ## Configuration
 
