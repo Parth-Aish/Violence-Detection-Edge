@@ -518,11 +518,23 @@ class PoseLSTMDetector:
             track.history.append(track.model_pose.reshape(FEATURE_COUNT).copy())
             track.activity *= 0.85
 
-        return [
+        active_tracks = [
             track
             for track in self._tracks.values()
             if now - track.last_seen <= 1.0
         ]
+        retained_tracks = sorted(
+            active_tracks,
+            key=lambda track: (track.last_seen, track.activity, track.confidence),
+            reverse=True,
+        )[:4]
+        retained_ids = {track.track_id for track in retained_tracks}
+        self._tracks = {
+            track_id: track
+            for track_id, track in self._tracks.items()
+            if track_id in retained_ids
+        }
+        return retained_tracks
 
     def _track_probability(self, track: TrackedPerson) -> float:
         if len(track.history) < 6:
