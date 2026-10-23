@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from inference import (
-    CONSECUTIVE_TRIGGERS_REQUIRED,
+    ALERT_HOLD_FRAMES,
     PoseLSTMDetector,
     ViolencePrediction,
 )
@@ -340,6 +340,10 @@ async def _process_websocket_frames(
                         "inference_ms": prediction.inference_ms,
                         "latency_ms": prediction.inference_ms,
                         "timestamp": prediction.timestamp,
+                        "person_count": prediction.person_count,
+                        "entity_count": prediction.entity_count,
+                        "secondary_entity_count": prediction.secondary_entity_count,
+                        "interaction_mode": prediction.interaction_mode,
                     }
                 ),
             )
@@ -355,51 +359,57 @@ async def _process_websocket_frames(
 
 def _annotate_frame(frame: np.ndarray, prediction: ViolencePrediction) -> np.ndarray:
     annotated = frame.copy()
-    if prediction.keypoints is not None and prediction.bbox is not None:
+    people = list(zip(prediction.person_boxes, prediction.person_keypoints))
+    if not people and prediction.keypoints is not None and prediction.bbox is not None:
+        people = [(prediction.bbox, prediction.keypoints)]
+    if people:
         height, width = annotated.shape[:2]
-        points = np.asarray(prediction.keypoints).reshape(-1, 2)
-        valid = np.any(points > 0.0, axis=1)
-        pixel_points = np.column_stack(
-            (
-                np.rint(points[:, 0] * width),
-                np.rint(points[:, 1] * height),
+        color = (0, 0, 255) if prediction.is_fighting else (40, 180, 90)
+        for person_index, (bbox, keypoints) in enumerate(people):
+            points = np.asarray(keypoints).reshape(-1, 2)
+            valid = np.any(points > 0.0, axis=1)
+            pixel_points = np.column_stack(
+                (
+                    np.rint(points[:, 0] * width),
+                    np.rint(points[:, 1] * height),
+                )
+            ).astype(np.int32)
+            for start, end in (
+                (0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9),
+                (6, 8), (8, 10), (5, 11), (6, 12), (11, 12), (11, 13),
+                (13, 15), (12, 14), (14, 16),
+            ):
+                if valid[start] and valid[end]:
+                    cv2.line(
+                        annotated,
+                        tuple(pixel_points[start]),
+                        tuple(pixel_points[end]),
+                        color,
+                        2,
+                        cv2.LINE_AA,
+                    )
+            for index, point in enumerate(pixel_points):
+                if valid[index]:
+                    cv2.circle(
+                        annotated, tuple(point), 3, (255, 190, 70), -1, cv2.LINE_AA
+                    )
+            x1, y1, x2, y2 = (int(value) for value in bbox)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            label = (
+                f"{prediction.severity.name} {prediction.probability:.2f}"
+                if person_index == 0
+                else f"Person {person_index + 1}"
             )
-        ).astype(np.int32)
-        color = (0, 0, 255) if prediction.is_fighting else (40, 180, 90)
-        for start, end in (
-            (0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9),
-            (6, 8), (8, 10), (5, 11), (6, 12), (11, 12), (11, 13),
-            (13, 15), (12, 14), (14, 16),
-        ):
-            if valid[start] and valid[end]:
-                cv2.line(
-                    annotated,
-                    tuple(pixel_points[start]),
-                    tuple(pixel_points[end]),
-                    color,
-                    2,
-                    cv2.LINE_AA,
-                )
-        for index, point in enumerate(pixel_points):
-            if valid[index]:
-                cv2.circle(
-                    annotated, tuple(point), 3, (255, 190, 70), -1, cv2.LINE_AA
-                )
-    if prediction.bbox is not None:
-        x1, y1, x2, y2 = (int(value) for value in prediction.bbox)
-        color = (0, 0, 255) if prediction.is_fighting else (40, 180, 90)
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        label = f"{prediction.severity.name} {prediction.probability:.2f}"
-        cv2.putText(
-            annotated,
-            label,
-            (x1, max(20, y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
+            cv2.putText(
+                annotated,
+                label,
+                (x1, max(20, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
     return annotated
 
 
@@ -467,7 +477,12 @@ async def _inference_loop() -> None:
                     "severity": prediction.severity.name,
                     "fps": measured_fps or prediction.fps,
                     "inference_ms": prediction.inference_ms,
+                    "latency_ms": prediction.inference_ms,
                     "timestamp": prediction.timestamp,
+                    "person_count": prediction.person_count,
+                    "entity_count": prediction.entity_count,
+                    "secondary_entity_count": prediction.secondary_entity_count,
+                    "interaction_mode": prediction.interaction_mode,
                 }
             )
         except asyncio.CancelledError:
@@ -542,7 +557,7 @@ async def health_check() -> dict:
         "fps_target": FRAME_FPS,
         "max_ingest_fps": MAX_INGEST_FPS,
         "violence_threshold": _classifier.threshold if _classifier else None,
-        "consecutive_triggers_required": CONSECUTIVE_TRIGGERS_REQUIRED,
+        "alert_hold_frames": ALERT_HOLD_FRAMES,
         "pose_stride": _classifier.pose_stride if _classifier else None,
         "ort_threads": _classifier.intra_op_threads if _classifier else None,
         "ingestion_alive": bool(_producer_task and not _producer_task.done()),

@@ -16,7 +16,7 @@ cv2.setNumThreads(1)
 logger = logging.getLogger("ingest")
 
 MAX_INGEST_FPS = 15
-QUEUE_SIZE = 30
+QUEUE_SIZE = 2
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"}
 
 
@@ -92,12 +92,19 @@ async def produce_frames(
     fps: int = MAX_INGEST_FPS,
     loop_file: bool = False,
 ) -> None:
-    """Read at no more than fifteen FPS and retain at most thirty pending frames."""
+    """Pace capture and skip stale local-video frames to stay on wall clock."""
     target_fps = min(max(fps, 1), MAX_INGEST_FPS)
     frame_interval = 1.0 / target_fps
     is_local_file = (
         "://" not in source and Path(source).suffix.lower() in VIDEO_EXTENSIONS
     )
+    native_fps_value = await asyncio.to_thread(capture.get, cv2.CAP_PROP_FPS)
+    native_fps = float(native_fps_value or 30.0)
+    if not np.isfinite(native_fps) or native_fps <= 0:
+        native_fps = 30.0
+    playback_start = time.perf_counter()
+    next_capture_at = playback_start
+    current_frame_idx = 0
     source_label = (
         "local video"
         if is_local_file
@@ -109,23 +116,45 @@ async def produce_frames(
 
     try:
         while not stop_event.is_set():
-            started = time.monotonic()
-            success, frame = await asyncio.to_thread(
-                _read_resized, capture, width, height
-            )
+            if is_local_file:
+                elapsed = time.perf_counter() - playback_start
+                target_idx = int(elapsed * native_fps)
+                skipped = 0
+                while current_frame_idx < target_idx and skipped < 15:
+                    grabbed = await asyncio.to_thread(capture.grab)
+                    if not grabbed:
+                        break
+                    current_frame_idx += 1
+                    skipped += 1
+                if current_frame_idx < target_idx and skipped == 15:
+                    await asyncio.sleep(0)
+                    continue
+                success, frame = await asyncio.to_thread(
+                    _read_resized, capture, width, height
+                )
+                if success:
+                    current_frame_idx += 1
+            else:
+                success, frame = await asyncio.to_thread(
+                    _read_resized, capture, width, height
+                )
             if not success or frame is None:
                 if is_local_file and loop_file:
                     if not await asyncio.to_thread(
                         capture.set, cv2.CAP_PROP_POS_FRAMES, 0
                     ):
                         raise RuntimeError(f"Could not rewind video source: {source}")
+                    playback_start = time.perf_counter()
+                    current_frame_idx = 0
+                    next_capture_at = playback_start
                     continue
                 if not stop_event.is_set():
                     logger.info("Video source reached end of stream: %s", source)
                 return
 
             _keep_latest_frame(frame_queue, frame)
-            remaining = frame_interval - (time.monotonic() - started)
+            next_capture_at += frame_interval
+            remaining = next_capture_at - time.perf_counter()
             if remaining > 0:
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=remaining)

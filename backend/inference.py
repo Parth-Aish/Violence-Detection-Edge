@@ -7,7 +7,7 @@ import os
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 from typing import Optional
@@ -25,9 +25,11 @@ KEYPOINT_VALUES = 3
 FEATURE_COUNT = KEYPOINT_COUNT * 2
 POSE_IMAGE_SIZE = 320
 POSE_CONFIDENCE = 0.25
+PRIMARY_PERSON_CONFIDENCE = 0.30
+SECONDARY_PROPOSAL_CONFIDENCE = 0.12
 POSE_NMS_THRESHOLD = 0.45
 VIOLENCE_THRESHOLD = 0.75
-CONSECUTIVE_TRIGGERS_REQUIRED = 3
+ALERT_HOLD_FRAMES = 4
 POSE_STRIDE = max(1, int(os.environ.get("POSE_STRIDE", "2")))
 
 
@@ -50,6 +52,41 @@ class ViolencePrediction:
     inference_ms: float
     fps: float
     keypoints: Optional[np.ndarray] = None
+    person_count: int = 0
+    entity_count: int = 0
+    secondary_entity_count: int = 0
+    interaction_mode: str = "Solo / Safe"
+    person_boxes: tuple[tuple[float, float, float, float], ...] = ()
+    person_keypoints: tuple[np.ndarray, ...] = ()
+    bio_score: float = 0.0
+
+
+@dataclass
+class TrackedPerson:
+    track_id: int
+    bbox: tuple[float, float, float, float]
+    keypoints: np.ndarray
+    model_pose: np.ndarray
+    confidence: float
+    history: deque[np.ndarray] = field(
+        default_factory=lambda: deque(maxlen=SEQUENCE_LENGTH)
+    )
+    last_detection_keypoints: np.ndarray = field(
+        default_factory=lambda: np.zeros((KEYPOINT_COUNT, 2), dtype=np.float32)
+    )
+    last_detection_time: float = 0.0
+    velocity: np.ndarray = field(
+        default_factory=lambda: np.zeros((KEYPOINT_COUNT, 2), dtype=np.float32)
+    )
+    acceleration: np.ndarray = field(
+        default_factory=lambda: np.zeros((KEYPOINT_COUNT, 2), dtype=np.float32)
+    )
+    center_y: float = 0.0
+    aspect_ratio: float = 0.0
+    center_drop: float = 0.0
+    aspect_collapse: float = 0.0
+    last_seen: float = 0.0
+    activity: float = 0.0
 
 
 class PoseLSTMDetector:
@@ -131,15 +168,15 @@ class PoseLSTMDetector:
         self.input_name = classifier_inputs[0].name
         self.output_name = classifier_outputs[0].name
         self._poses: deque[np.ndarray] = deque(maxlen=SEQUENCE_LENGTH)
-        self.consecutive_triggers = 0
         self.pose_stride = POSE_STRIDE
         self._frame_index = 0
-        self._frames_since_detection = 0
-        self._cached_pose = np.zeros(FEATURE_COUNT, dtype=np.float32)
-        self._last_detected_pose: Optional[np.ndarray] = None
-        self._pose_velocity = np.zeros(FEATURE_COUNT, dtype=np.float32)
-        self._cached_confidence = 0.0
-        self._cached_bbox: Optional[tuple[float, float, float, float]] = None
+        self._tracks: dict[int, TrackedPerson] = {}
+        self._next_track_id = 1
+        self._last_gray: Optional[np.ndarray] = None
+        self._last_frame_size: Optional[tuple[int, int]] = None
+        self._secondary_boxes: list[tuple[float, float, float, float]] = []
+        self._secondary_count = 0
+        self._alert_hold_frames = 0
         self._last_frame_time: Optional[float] = None
         self._fps = 0.0
         self._lock = threading.Lock()
@@ -173,9 +210,59 @@ class PoseLSTMDetector:
         )
         return boxed, scale, pad_x, pad_y
 
-    def _extract_largest_person(
+    @staticmethod
+    def _box_iou(
+        first: tuple[float, float, float, float],
+        second: tuple[float, float, float, float],
+    ) -> float:
+        x1 = max(first[0], second[0])
+        y1 = max(first[1], second[1])
+        x2 = min(first[2], second[2])
+        y2 = min(first[3], second[3])
+        intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        first_area = max(0.0, first[2] - first[0]) * max(
+            0.0, first[3] - first[1]
+        )
+        second_area = max(0.0, second[2] - second[0]) * max(
+            0.0, second[3] - second[1]
+        )
+        union = first_area + second_area - intersection
+        return intersection / union if union > 0 else 0.0
+
+    def _decode_pose_rows(
+        self, rows: np.ndarray, width: int, height: int, scale: float, pad_x: int, pad_y: int
+    ) -> list[tuple[np.ndarray, float, tuple[float, float, float, float]]]:
+        detections = []
+        for row in rows:
+            center_x, center_y, box_width, box_height = row[:4]
+            keypoints = row[5:].reshape(KEYPOINT_COUNT, KEYPOINT_VALUES)
+            points = keypoints[:, :2].astype(np.float32, copy=True)
+            points[:, 0] = (points[:, 0] - pad_x) / scale
+            points[:, 1] = (points[:, 1] - pad_y) / scale
+            points[:, 0] = np.clip(points[:, 0] / max(width, 1), 0.0, 1.0)
+            points[:, 1] = np.clip(points[:, 1] / max(height, 1), 0.0, 1.0)
+            x1 = np.clip((center_x - box_width / 2 - pad_x) / scale, 0, width)
+            y1 = np.clip((center_y - box_height / 2 - pad_y) / scale, 0, height)
+            x2 = np.clip((center_x + box_width / 2 - pad_x) / scale, 0, width)
+            y2 = np.clip((center_y + box_height / 2 - pad_y) / scale, 0, height)
+            detections.append(
+                (
+                    points,
+                    float(row[4]),
+                    (float(x1), float(y1), float(x2), float(y2)),
+                )
+            )
+        return detections
+
+    def detect_entities(
         self, frame: np.ndarray
-    ) -> tuple[np.ndarray, float, Optional[tuple[float, float, float, float]]]:
+    ) -> tuple[
+        list[tuple[np.ndarray, float, tuple[float, float, float, float]]],
+        int,
+        np.ndarray,
+        list[tuple[float, float, float, float]],
+    ]:
+        """Detect pose-backed people, weak proposals, and nearby foreground motion."""
         height, width = frame.shape[:2]
         boxed, scale, pad_x, pad_y = self._letterbox(frame)
         image = boxed[:, :, ::-1].transpose(2, 0, 1)
@@ -197,50 +284,334 @@ class PoseLSTMDetector:
             )
 
         scores = rows[:, 4]
-        candidates = np.flatnonzero(scores >= POSE_CONFIDENCE)
-        if candidates.size == 0:
-            return np.zeros(FEATURE_COUNT, dtype=np.float32), 0.0, None
-
-        boxes: list[list[float]] = []
-        candidate_scores: list[float] = []
-        for index in candidates:
-            center_x, center_y, box_width, box_height = rows[index, :4]
-            boxes.append(
-                [
-                    float(center_x - box_width / 2),
-                    float(center_y - box_height / 2),
-                    float(box_width),
-                    float(box_height),
-                ]
-            )
-            candidate_scores.append(float(scores[index]))
-
-        kept = cv2.dnn.NMSBoxes(
-            boxes, candidate_scores, POSE_CONFIDENCE, POSE_NMS_THRESHOLD
+        primary_indices = np.flatnonzero(scores >= PRIMARY_PERSON_CONFIDENCE)
+        primary_rows = rows[primary_indices]
+        primary_boxes = [
+            [
+                float(row[0] - row[2] / 2),
+                float(row[1] - row[3] / 2),
+                float(row[2]),
+                float(row[3]),
+            ]
+            for row in primary_rows
+        ]
+        primary_scores = [float(row[4]) for row in primary_rows]
+        primary_kept = (
+            np.asarray(
+                cv2.dnn.NMSBoxes(
+                    primary_boxes,
+                    primary_scores,
+                    PRIMARY_PERSON_CONFIDENCE,
+                    POSE_NMS_THRESHOLD,
+                )
+            ).reshape(-1)
+            if primary_boxes
+            else np.array([], dtype=np.int32)
         )
-        kept_indices = np.asarray(kept).reshape(-1)
-        if kept_indices.size == 0:
-            return np.zeros(FEATURE_COUNT, dtype=np.float32), 0.0, None
-        selected = int(kept_indices[np.argmax(scores[candidates[kept_indices]])])
-        row = rows[candidates[selected]]
+        if primary_kept.size:
+            primary_kept = primary_kept[
+                np.argsort(np.asarray(primary_scores)[primary_kept])[::-1][:4]
+            ]
+        detections = self._decode_pose_rows(
+            primary_rows[primary_kept], width, height, scale, pad_x, pad_y
+        )
 
-        keypoints = row[5:].reshape(KEYPOINT_COUNT, KEYPOINT_VALUES)
-        points = keypoints[:, :2].astype(np.float32, copy=True)
-        points[:, 0] = (points[:, 0] - pad_x) / scale
-        points[:, 1] = (points[:, 1] - pad_y) / scale
-        points[:, 0] = np.clip(points[:, 0] / max(width, 1), 0.0, 1.0)
-        points[:, 1] = np.clip(points[:, 1] / max(height, 1), 0.0, 1.0)
+        weak_indices = np.flatnonzero(
+            (scores >= SECONDARY_PROPOSAL_CONFIDENCE)
+            & (scores < PRIMARY_PERSON_CONFIDENCE)
+        )
+        weak_rows = rows[weak_indices]
+        weak_boxes = [
+            [
+                float(row[0] - row[2] / 2),
+                float(row[1] - row[3] / 2),
+                float(row[2]),
+                float(row[3]),
+            ]
+            for row in weak_rows
+        ]
+        weak_scores = [float(row[4]) for row in weak_rows]
+        weak_kept = (
+            np.asarray(
+                cv2.dnn.NMSBoxes(
+                    weak_boxes,
+                    weak_scores,
+                    SECONDARY_PROPOSAL_CONFIDENCE,
+                    POSE_NMS_THRESHOLD,
+                )
+            ).reshape(-1)
+            if weak_boxes
+            else np.array([], dtype=np.int32)
+        )
+        secondary_boxes = []
+        for index in weak_kept:
+            row = weak_rows[index]
+            x1 = np.clip((row[0] - row[2] / 2 - pad_x) / scale, 0, width)
+            y1 = np.clip((row[1] - row[3] / 2 - pad_y) / scale, 0, height)
+            x2 = np.clip((row[0] + row[2] / 2 - pad_x) / scale, 0, width)
+            y2 = np.clip((row[1] + row[3] / 2 - pad_y) / scale, 0, height)
+            candidate_box = (float(x1), float(y1), float(x2), float(y2))
+            if all(self._box_iou(candidate_box, item[2]) < 0.3 for item in detections):
+                secondary_boxes.append(candidate_box)
 
-        center_x, center_y, box_width, box_height = row[:4]
-        x1 = np.clip((center_x - box_width / 2 - pad_x) / scale, 0, width)
-        y1 = np.clip((center_y - box_height / 2 - pad_y) / scale, 0, height)
-        x2 = np.clip((center_x + box_width / 2 - pad_x) / scale, 0, width)
-        y2 = np.clip((center_y + box_height / 2 - pad_y) / scale, 0, height)
-        bbox = (float(x1), float(y1), float(x2), float(y2))
-        return (
-            points.reshape(FEATURE_COUNT),
-            float(scores[candidates[selected]]),
-            bbox,
+        secondary_count = len(secondary_boxes)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, (max(1, width // 4), max(1, height // 4)))
+        motion_found = False
+        if self._last_gray is not None and self._last_gray.shape == small.shape and detections:
+            difference = cv2.absdiff(self._last_gray, small)
+            foreground_mask = np.full(small.shape, 255, dtype=np.uint8)
+            for _, _, box in detections:
+                x1 = max(0, int((box[0] - (box[2] - box[0]) * 0.1) / 4))
+                y1 = max(0, int((box[1] - (box[3] - box[1]) * 0.1) / 4))
+                x2 = min(
+                    small.shape[1],
+                    int((box[2] + (box[2] - box[0]) * 0.1) / 4),
+                )
+                y2 = min(
+                    small.shape[0],
+                    int((box[3] + (box[3] - box[1]) * 0.1) / 4),
+                )
+                foreground_mask[y1:y2, x1:x2] = 0
+            difference = cv2.bitwise_and(difference, difference, mask=foreground_mask)
+            _, motion = cv2.threshold(difference, 25, 255, cv2.THRESH_BINARY)
+            motion = cv2.morphologyEx(
+                motion, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8)
+            )
+            contours, _ = cv2.findContours(
+                motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            small_area = small.shape[0] * small.shape[1]
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area <= small_area * 0.03:
+                    continue
+                moment = cv2.moments(contour)
+                if moment["m00"] == 0:
+                    continue
+                cx = moment["m10"] / moment["m00"] * 4
+                cy = moment["m01"] / moment["m00"] * 4
+                if any(
+                    min(
+                        np.hypot(cx - box[0], cy - box[1]),
+                        np.hypot(cx - box[2], cy - box[3]),
+                    )
+                    <= max(width, height) * 0.35
+                    for _, _, box in detections
+                ):
+                    motion_found = True
+                    break
+
+        if motion_found:
+            secondary_count = max(secondary_count, 1)
+        self._last_gray = small
+        self._last_frame_size = (width, height)
+        self._secondary_boxes = secondary_boxes
+        self._secondary_count = secondary_count
+        return detections, secondary_count, small, secondary_boxes
+
+    @staticmethod
+    def _center(box: tuple[float, float, float, float]) -> np.ndarray:
+        return np.array(((box[0] + box[2]) / 2, (box[1] + box[3]) / 2))
+
+    @staticmethod
+    def _box_aspect(box: tuple[float, float, float, float]) -> float:
+        return (box[3] - box[1]) / max(box[2] - box[0], 1.0)
+
+    def _update_tracks(
+        self,
+        detections: list[tuple[np.ndarray, float, tuple[float, float, float, float]]],
+        *,
+        now: float,
+        dt: float,
+        frame_width: int,
+        frame_height: int,
+    ) -> list[TrackedPerson]:
+        available_tracks = list(self._tracks.values())
+        candidates = []
+        max_distance = max(frame_width, frame_height) * 0.35
+        for track_index, track in enumerate(available_tracks):
+            old_center = self._center(track.bbox)
+            for detection_index, (_, _, box) in enumerate(detections):
+                distance = float(np.linalg.norm(old_center - self._center(box)))
+                if distance <= max_distance:
+                    candidates.append((distance, track_index, detection_index))
+
+        matched_tracks: set[int] = set()
+        matched_detections: set[int] = set()
+        assignments: dict[int, int] = {}
+        for _, track_index, detection_index in sorted(candidates):
+            if track_index in matched_tracks or detection_index in matched_detections:
+                continue
+            matched_tracks.add(track_index)
+            matched_detections.add(detection_index)
+            assignments[detection_index] = track_index
+
+        time_scale = (1.0 / 15.0) / max(dt, 0.02)
+        for detection_index, (points, confidence, box) in enumerate(detections):
+            if detection_index in assignments:
+                track = available_tracks[assignments[detection_index]]
+                previous_velocity = track.velocity.copy()
+                correction = points - track.keypoints
+                detection_delta = points - track.last_detection_keypoints
+                detection_dt = max(now - track.last_detection_time, 0.02)
+                measured_velocity = detection_delta / detection_dt
+                track.acceleration = (measured_velocity - previous_velocity) / max(
+                    detection_dt, 0.02
+                )
+                track.velocity = measured_velocity
+                track.model_pose = np.clip(
+                    track.model_pose + correction * time_scale, 0.0, 1.0
+                )
+                previous_center_y = track.center_y
+                previous_aspect = track.aspect_ratio
+                track.center_y = float(self._center(box)[1] / max(frame_height, 1))
+                track.aspect_ratio = self._box_aspect(box)
+                center_drop = max(0.0, track.center_y - previous_center_y)
+                aspect_collapse = max(0.0, previous_aspect - track.aspect_ratio)
+                track.activity = max(
+                    track.activity * 0.65,
+                    float(np.linalg.norm(track.velocity[[9, 10, 15, 16]], axis=1).max()),
+                    center_drop / max(dt, 0.02),
+                    aspect_collapse / max(dt, 0.02),
+                )
+                track.keypoints = points
+                track.last_detection_keypoints = points.copy()
+                track.last_detection_time = now
+                track.bbox = box
+                track.confidence = confidence
+                track.last_seen = now
+                track.history.append(track.model_pose.reshape(FEATURE_COUNT).copy())
+                track.center_drop = center_drop
+                track.aspect_collapse = aspect_collapse
+            else:
+                track = TrackedPerson(
+                    track_id=self._next_track_id,
+                    bbox=box,
+                    keypoints=points,
+                    model_pose=points.copy(),
+                    last_detection_keypoints=points.copy(),
+                    last_detection_time=now,
+                    confidence=confidence,
+                    center_y=float(self._center(box)[1] / max(frame_height, 1)),
+                    aspect_ratio=self._box_aspect(box),
+                    last_seen=now,
+                )
+                track.history.append(track.model_pose.reshape(FEATURE_COUNT).copy())
+                track.center_drop = 0.0
+                track.aspect_collapse = 0.0
+                self._tracks[track.track_id] = track
+                self._next_track_id += 1
+
+        for track_index, track in enumerate(available_tracks):
+            if track_index in matched_tracks:
+                continue
+            age = now - track.last_seen
+            if age > 1.0:
+                self._tracks.pop(track.track_id, None)
+                continue
+            delta = track.velocity * max(dt, 0.02)
+            track.keypoints = np.clip(track.keypoints + delta, 0.0, 1.0)
+            track.model_pose = np.clip(
+                track.model_pose + delta * time_scale, 0.0, 1.0
+            )
+            track.history.append(track.model_pose.reshape(FEATURE_COUNT).copy())
+            track.activity *= 0.85
+
+        return [
+            track
+            for track in self._tracks.values()
+            if now - track.last_seen <= 1.0
+        ]
+
+    def _track_probability(self, track: TrackedPerson) -> float:
+        if len(track.history) < 6:
+            return 0.0
+        sequence = list(track.history)
+        if len(sequence) < SEQUENCE_LENGTH:
+            sequence = [sequence[0]] * (SEQUENCE_LENGTH - len(sequence)) + sequence
+        model_input = np.asarray(sequence[-SEQUENCE_LENGTH:], dtype=np.float32)
+        output = self.session.run(
+            [self.output_name],
+            {self.input_name: model_input[np.newaxis, :, :]},
+        )[0]
+        probability = float(np.asarray(output).reshape(-1)[0])
+        if not np.isfinite(probability):
+            raise RuntimeError("ONNX classifier returned a non-finite probability.")
+        return float(np.clip(probability, 0.0, 1.0))
+
+    @staticmethod
+    def _wrist_points(track: TrackedPerson) -> np.ndarray:
+        return track.keypoints[[9, 10]]
+
+    def _biomechanical_score(
+        self,
+        active_tracks: list[TrackedPerson],
+        secondary_boxes: list[tuple[float, float, float, float]],
+        *,
+        person_count: int,
+        secondary_count: int,
+        frame_width: int,
+        frame_height: int,
+    ) -> float:
+        if not active_tracks:
+            return 0.0
+        pair_scores = []
+        for track in active_tracks[:2]:
+            strike_speed = float(
+                np.linalg.norm(track.velocity[[9, 10, 15, 16]], axis=1).max()
+            )
+            strike_acceleration = float(
+                np.linalg.norm(track.acceleration[[9, 10, 15, 16]], axis=1).max()
+            )
+            strike = min(strike_speed / 2.0, 1.0)
+            burst = min(strike_acceleration / 12.0, 1.0)
+            knockdown = max(
+                min(track.center_drop / 0.12, 1.0),
+                min(track.aspect_collapse / 0.7, 1.0),
+            )
+            pair_scores.append((strike, burst, knockdown))
+
+        proximity = 0.0
+        if person_count >= 2 and len(active_tracks) >= 2:
+            first, second = active_tracks[:2]
+            proximity = 1.0 if self._box_iou(first.bbox, second.bbox) > 0.10 else 0.0
+            second_center = self._center(second.bbox) / np.array(
+                [max(frame_width, 1), max(frame_height, 1)]
+            )
+            first_wrists = self._wrist_points(first)
+            wrist_distance = float(
+                np.linalg.norm(first_wrists - second_center, axis=1).min()
+            )
+            proximity = max(
+                proximity,
+                float(wrist_distance < 0.25 * frame_width / max(frame_width, 1)),
+            )
+        elif person_count == 1 and secondary_count:
+            track = active_tracks[0]
+            if secondary_boxes:
+                for box in secondary_boxes:
+                    if self._box_iou(track.bbox, box) > 0.10:
+                        proximity = 1.0
+                        break
+                    target = self._center(box) / np.array(
+                        [max(frame_width, 1), max(frame_height, 1)]
+                    )
+                    if np.linalg.norm(self._wrist_points(track) - target, axis=1).min() < 0.25:
+                        proximity = 1.0
+                        break
+            if proximity == 0.0:
+                proximity = 0.5
+
+        strike = max(item[0] for item in pair_scores)
+        burst = max(item[1] for item in pair_scores)
+        knockdown = max(item[2] for item in pair_scores)
+        return float(
+            np.clip(
+                0.35 * strike + 0.20 * burst + 0.30 * proximity + 0.15 * knockdown,
+                0.0,
+                1.0,
+            )
         )
 
     def process_frame(self, frame: np.ndarray) -> ViolencePrediction:
@@ -251,28 +622,28 @@ class PoseLSTMDetector:
     def _process_frame(self, frame: np.ndarray) -> ViolencePrediction:
         started = time.perf_counter()
         now = time.time()
-        self._frames_since_detection += 1
+        elapsed = (
+            now - self._last_frame_time if self._last_frame_time is not None else 1 / 15
+        )
+        dt = max(elapsed, 0.02)
+        frame_height, frame_width = frame.shape[:2]
         if self._frame_index % self.pose_stride == 0:
-            pose, confidence, bbox = self._extract_largest_person(frame)
-            if self._last_detected_pose is not None and self._frames_since_detection:
-                self._pose_velocity = (
-                    pose - self._last_detected_pose
-                ) / self._frames_since_detection
-            self._last_detected_pose = pose.copy()
-            self._cached_pose = pose.copy()
-            self._cached_confidence = confidence
-            self._cached_bbox = bbox
-            self._frames_since_detection = 0
+            detections, secondary_count, _, secondary_boxes = self.detect_entities(frame)
+            self._secondary_boxes = secondary_boxes
+            self._secondary_count = secondary_count
         else:
-            self._cached_pose = self._cached_pose + 0.5 * self._pose_velocity
-            self._cached_pose = np.clip(self._cached_pose, 0.0, 1.0)
-            pose = self._cached_pose.copy()
-            confidence = self._cached_confidence
-            bbox = self._cached_bbox
+            detections = []
+            secondary_count = self._secondary_count
+            secondary_boxes = self._secondary_boxes
+        tracks = self._update_tracks(
+            detections,
+            now=now,
+            dt=dt,
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
         self._frame_index += 1
-        self._poses.append(pose)
         if self._last_frame_time is not None:
-            elapsed = now - self._last_frame_time
             if elapsed > 0:
                 instant_fps = 1.0 / elapsed
                 self._fps = (
@@ -282,23 +653,46 @@ class PoseLSTMDetector:
                 )
         self._last_frame_time = now
 
-        probability = 0.0
-        if len(self._poses) == SEQUENCE_LENGTH:
-            sequence = np.stack(self._poses).astype(np.float32, copy=False)
-            output = self.session.run(
-                [self.output_name],
-                {self.input_name: sequence[np.newaxis, :, :]},
-            )[0]
-            probability = float(np.asarray(output).reshape(-1)[0])
-            if not np.isfinite(probability):
-                raise RuntimeError("ONNX classifier returned a non-finite probability.")
-            probability = float(np.clip(probability, 0.0, 1.0))
-
-        if probability > self.threshold:
-            self.consecutive_triggers += 1
+        person_count = len(tracks)
+        active_tracks = sorted(tracks, key=lambda item: item.activity, reverse=True)[:2]
+        onnx_probability = max(
+            (self._track_probability(track) for track in active_tracks),
+            default=0.0,
+        )
+        total_entities = person_count + secondary_count
+        interaction_active = person_count >= 2 or (
+            person_count == 1 and secondary_count >= 1
+        )
+        if person_count >= 2:
+            interaction_mode = "2+ Persons"
+        elif person_count == 1 and secondary_count >= 1:
+            interaction_mode = "Person + Entity/Animal"
         else:
-            self.consecutive_triggers = 0
-        is_fighting = self.consecutive_triggers >= CONSECUTIVE_TRIGGERS_REQUIRED
+            interaction_mode = "Solo / Safe"
+
+        bio_score = self._biomechanical_score(
+            active_tracks,
+            secondary_boxes,
+            person_count=person_count,
+            secondary_count=secondary_count,
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+        if interaction_active:
+            probability = max(
+                onnx_probability,
+                0.65 * bio_score + 0.35 * onnx_probability,
+            )
+            if probability >= 0.58:
+                self._alert_hold_frames = ALERT_HOLD_FRAMES
+            elif self._alert_hold_frames:
+                self._alert_hold_frames -= 1
+            is_fighting = self._alert_hold_frames > 0
+        else:
+            probability = min(onnx_probability, 0.249)
+            self._alert_hold_frames = 0
+            is_fighting = False
+
         if not is_fighting:
             severity = Severity.NONE
         elif probability >= 0.98:
@@ -307,30 +701,38 @@ class PoseLSTMDetector:
             severity = Severity.HIGH
         else:
             severity = Severity.MEDIUM
+        primary = active_tracks[0] if active_tracks else None
         return ViolencePrediction(
             is_fighting=is_fighting,
             probability=probability,
             severity=severity,
-            confidence=confidence,
-            bbox=bbox,
+            confidence=primary.confidence if primary else 0.0,
+            bbox=primary.bbox if primary else None,
             timestamp=now,
             inference_ms=(time.perf_counter() - started) * 1000.0,
             fps=self._fps,
-            keypoints=pose.reshape(KEYPOINT_COUNT, 2).copy(),
+            keypoints=primary.keypoints.copy() if primary else None,
+            person_count=person_count,
+            entity_count=total_entities,
+            interaction_mode=interaction_mode,
+            person_boxes=tuple(track.bbox for track in tracks),
+            person_keypoints=tuple(track.keypoints.copy() for track in tracks),
+            bio_score=bio_score,
+            secondary_entity_count=secondary_count,
         )
 
     def reset(self) -> None:
         """Clear temporal features after the source changes."""
         with self._lock:
             self._poses.clear()
-            self.consecutive_triggers = 0
             self._frame_index = 0
-            self._frames_since_detection = 0
-            self._cached_pose.fill(0.0)
-            self._last_detected_pose = None
-            self._pose_velocity.fill(0.0)
-            self._cached_confidence = 0.0
-            self._cached_bbox = None
+            self._tracks.clear()
+            self._next_track_id = 1
+            self._last_gray = None
+            self._last_frame_size = None
+            self._secondary_boxes.clear()
+            self._secondary_count = 0
+            self._alert_hold_frames = 0
             self._last_frame_time = None
             self._fps = 0.0
 

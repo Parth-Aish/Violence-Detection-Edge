@@ -44,9 +44,14 @@ const EMPTY_STATS: Stats = { LOW: 0, MEDIUM: 0, HIGH: 0, CRITICAL: 0, total: 0 }
 export default function DashboardPage() {
   const [frame, setFrame] = useState<string | null>(null);
   const [isViolence, setIsViolence] = useState(false);
+  const [hasPrediction, setHasPrediction] = useState(false);
   const [probability, setProbability] = useState(0);
   const [fps, setFps] = useState(0);
   const [latency, setLatency] = useState(0);
+  const [personCount, setPersonCount] = useState(0);
+  const [entityCount, setEntityCount] = useState(0);
+  const [secondaryEntityCount, setSecondaryEntityCount] = useState(0);
+  const [interactionMode, setInteractionMode] = useState("Solo / Safe");
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
   const [sourceMode, setSourceMode] = useState<SourceMode>("idle");
   const [incidents, setIncidents] = useState<Incident[]>([]);
@@ -116,9 +121,14 @@ export default function DashboardPage() {
             clientFramePendingRef.current = false;
             setFrame(message.data);
             setIsViolence(message.is_violence === true);
+            setHasPrediction(true);
             setProbability(Number(message.probability) || 0);
             setFps(Number(message.fps) || 0);
             setLatency(Number(message.latency_ms ?? message.inference_ms) || 0);
+            setPersonCount(Number(message.person_count) || 0);
+            setEntityCount(Number(message.entity_count) || 0);
+            setSecondaryEntityCount(Number(message.secondary_entity_count) || 0);
+            setInteractionMode(String(message.interaction_mode ?? "Solo / Safe"));
           } else if (message.type === "incident") {
             const incident = message.data as Incident;
             setIncidents((previous) => [incident, ...previous].slice(0, 100));
@@ -164,7 +174,12 @@ export default function DashboardPage() {
       }
       setFrame(null);
       setIsViolence(false);
+      setHasPrediction(false);
       setProbability(0);
+      setPersonCount(0);
+      setEntityCount(0);
+      setSecondaryEntityCount(0);
+      setInteractionMode("Solo / Safe");
       return true;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not switch video source.");
@@ -182,6 +197,8 @@ export default function DashboardPage() {
       if (!(await switchSource("/api/source/webcam", { method: "POST" }))) return;
       if (!navigator.mediaDevices?.getUserMedia) {
         setError("Browser camera access is unavailable. Use HTTPS or a supported browser, then try again.");
+        stopBrowserCamera(true);
+        setSourceMode("idle");
         return;
       }
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -231,12 +248,13 @@ export default function DashboardPage() {
           clientFramePendingRef.current = false;
           setError("Could not send camera frames to the inference service.");
         }
-      }, 100);
+      }, 150);
       setSourceMode("webcam");
       setFilename(null);
       setError(null);
     } catch (cause) {
-      stopBrowserCamera();
+      stopBrowserCamera(true);
+      setSourceMode("idle");
       const detail =
         cause instanceof DOMException && cause.name === "NotAllowedError"
           ? "Camera permission was denied. Allow camera access in your browser and try again."
@@ -294,7 +312,6 @@ export default function DashboardPage() {
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#08090b] text-white">
-      <video ref={videoRef} autoPlay playsInline muted className="hidden" />
       <canvas ref={canvasRef} width={480} height={360} className="hidden" />
       <header className="mx-4 mt-4 flex items-center justify-between rounded-2xl border border-white/[0.08] bg-white/[0.04] px-5 py-4 shadow-xl shadow-black/20 backdrop-blur-2xl md:mx-8">
         <div>
@@ -327,7 +344,14 @@ export default function DashboardPage() {
       <main className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto px-4 pb-4 pt-4 md:px-8 lg:flex-row">
         <section className="flex min-h-[420px] min-w-0 flex-1 flex-col gap-4">
           <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-3xl border border-white/10 bg-black shadow-[0_24px_100px_-40px_rgba(99,102,241,0.35)]">
-            {frame ? (
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className={sourceMode === "webcam" ? "absolute inset-0 h-full w-full object-contain" : "hidden"}
+            />
+            {sourceMode !== "webcam" && frame ? (
               <Image
                 src={`data:image/jpeg;base64,${frame}`}
                 alt="Live violence-monitoring video"
@@ -336,7 +360,7 @@ export default function DashboardPage() {
                 unoptimized
                 className="h-full w-full object-contain"
               />
-            ) : (
+            ) : sourceMode !== "webcam" ? (
               <div className="px-6 text-center">
                 <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04] text-2xl text-zinc-500">
                   ◉
@@ -348,12 +372,22 @@ export default function DashboardPage() {
                   Select a video source below to begin monitoring.
                 </p>
               </div>
-            )}
+            ) : null}
 
             <div className="absolute left-4 top-4 rounded-full border border-white/10 bg-black/50 px-3 py-1.5 text-[10px] font-medium uppercase tracking-widest text-white/70 backdrop-blur-lg">
               {sourceMode === "webcam" ? "Browser webcam" : sourceMode === "rtsp" ? "RTSP stream" : sourceMode === "idle" ? "No source selected" : filename ?? "Uploaded video"}
             </div>
-            {frame && (
+            {(sourceMode === "webcam" || frame) && (
+              <div
+                title={hasPrediction ? `Total entities: ${entityCount}` : undefined}
+                className="absolute right-4 top-4 rounded-full border border-white/10 bg-black/60 px-3 py-1.5 text-[10px] font-medium text-white/80 backdrop-blur-lg"
+              >
+                {hasPrediction
+                  ? `Persons: ${personCount} | Entities/Animals: ${secondaryEntityCount} | ${interactionMode}`
+                  : "Awaiting scene analysis"}
+              </div>
+            )}
+            {hasPrediction && (
               <div
                 role={isViolence ? "alert" : "status"}
                 aria-live={isViolence ? "assertive" : "polite"}
@@ -385,7 +419,12 @@ export default function DashboardPage() {
                     setSourceMode("idle");
                     setFrame(null);
                     setIsViolence(false);
-                    setProbability(0);
+                            setHasPrediction(false);
+                            setProbability(0);
+                            setPersonCount(0);
+                            setEntityCount(0);
+                            setSecondaryEntityCount(0);
+                            setInteractionMode("Solo / Safe");
                   } else {
                     void selectWebcam();
                   }
