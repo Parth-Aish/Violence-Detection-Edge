@@ -219,6 +219,11 @@ export default function DashboardPage() {
       video.srcObject = stream;
       await video.play();
       clientFramePendingRef.current = false;
+      const frameInterval =
+        window.location.hostname === "localhost" ||
+        window.location.hostname === "127.0.0.1"
+          ? 33
+          : 150;
       captureTimerRef.current = setInterval(() => {
         const socket = socketRef.current;
         if (
@@ -248,7 +253,7 @@ export default function DashboardPage() {
           clientFramePendingRef.current = false;
           setError("Could not send camera frames to the inference service.");
         }
-      }, 150);
+      }, frameInterval);
       setSourceMode("webcam");
       setFilename(null);
       setError(null);

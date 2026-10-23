@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -15,7 +16,7 @@ cv2.setNumThreads(1)
 
 logger = logging.getLogger("ingest")
 
-MAX_INGEST_FPS = 15
+MAX_INGEST_FPS = 15 if os.getenv("RENDER") is not None else 30
 QUEUE_SIZE = 2
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".ts", ".webm"}
 

@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from inference import (
     ALERT_HOLD_FRAMES,
+    CONSECUTIVE_TRIGGERS_REQUIRED,
     PoseLSTMDetector,
     ViolencePrediction,
 )
@@ -558,6 +559,7 @@ async def health_check() -> dict:
         "max_ingest_fps": MAX_INGEST_FPS,
         "violence_threshold": _classifier.threshold if _classifier else None,
         "alert_hold_frames": ALERT_HOLD_FRAMES,
+        "consecutive_triggers_required": CONSECUTIVE_TRIGGERS_REQUIRED,
         "pose_stride": _classifier.pose_stride if _classifier else None,
         "ort_threads": _classifier.intra_op_threads if _classifier else None,
         "ingestion_alive": bool(_producer_task and not _producer_task.done()),

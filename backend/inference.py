@@ -31,8 +31,11 @@ SECONDARY_PROPOSAL_CONFIDENCE = 0.18
 POSE_NMS_THRESHOLD = 0.45
 VIOLENCE_THRESHOLD = 0.58
 BIO_SCORE_FLOOR = 0.56
-ALERT_HOLD_FRAMES = 4
-POSE_STRIDE = max(1, int(os.environ.get("POSE_STRIDE", "2")))
+STRONG_BIO_SCORE_THRESHOLD = 0.60
+CONSECUTIVE_TRIGGERS_REQUIRED = 2
+ALERT_HOLD_FRAMES = 3
+DEFAULT_POSE_STRIDE = 2 if os.getenv("RENDER") is not None else 1
+POSE_STRIDE = max(1, int(os.environ.get("POSE_STRIDE", str(DEFAULT_POSE_STRIDE))))
 
 
 class Severity(IntEnum):
@@ -70,6 +73,7 @@ class TrackedPerson:
     keypoints: np.ndarray
     model_pose: np.ndarray
     confidence: float
+    previous_bbox: Optional[tuple[float, float, float, float]] = None
     history: deque[np.ndarray] = field(
         default_factory=lambda: deque(maxlen=SEQUENCE_LENGTH)
     )
@@ -128,15 +132,19 @@ class PoseLSTMDetector:
             if not model_path.is_file():
                 raise FileNotFoundError(f"Required ONNX model not found: {model_path}")
 
-        threads = (
-            intra_op_threads
-            if intra_op_threads is not None
-            else int(
-                os.environ.get(
-                    "ORT_THREADS", os.environ.get("ONNX_INTRA_OP_THREADS", "1")
+        if intra_op_threads is not None:
+            threads = intra_op_threads
+        elif os.getenv("ORT_THREADS") is not None:
+            threads = int(os.environ["ORT_THREADS"])
+        elif os.getenv("RENDER") is not None:
+            threads = int(os.getenv("ONNX_INTRA_OP_THREADS", "1"))
+        else:
+            threads = int(
+                os.getenv(
+                    "ONNX_INTRA_OP_THREADS",
+                    str(min(4, os.cpu_count() or 4)),
                 )
             )
-        )
         if threads < 1:
             raise ValueError("ONNX intra-op thread count must be at least one.")
         self.intra_op_threads = threads
@@ -176,9 +184,14 @@ class PoseLSTMDetector:
         self._next_track_id = 1
         self._last_gray: Optional[np.ndarray] = None
         self._last_frame_size: Optional[tuple[int, int]] = None
+        self._prev_person_boxes: list[
+            tuple[float, float, float, float]
+        ] = []
         self._secondary_boxes: list[tuple[float, float, float, float]] = []
         self._secondary_count = 0
+        self._secondary_persistence_frames = 0
         self._alert_hold_frames = 0
+        self._consecutive_triggers = 0
         self._last_frame_time: Optional[float] = None
         self._fps = 0.0
         self._lock = threading.Lock()
@@ -230,6 +243,15 @@ class PoseLSTMDetector:
         )
         union = first_area + second_area - intersection
         return intersection / union if union > 0 else 0.0
+
+    @staticmethod
+    def _point_to_box_distance(
+        point: np.ndarray,
+        box: tuple[float, float, float, float],
+    ) -> float:
+        dx = max(box[0] - point[0], 0.0, point[0] - box[2])
+        dy = max(box[1] - point[1], 0.0, point[1] - box[3])
+        return float(np.hypot(dx, dy))
 
     def _decode_pose_rows(
         self, rows: np.ndarray, width: int, height: int, scale: float, pad_x: int, pad_y: int
@@ -354,11 +376,24 @@ class PoseLSTMDetector:
             y2 = np.clip((row[1] + row[3] / 2 - pad_y) / scale, 0, height)
             candidate_box = (float(x1), float(y1), float(x2), float(y2))
             if all(self._box_iou(candidate_box, item[2]) < 0.3 for item in detections):
+                if len(detections) == 1:
+                    person_points = detections[0][0][[9, 10, 15, 16]] * np.array(
+                        [width, height], dtype=np.float32
+                    )
+                    if min(
+                        (
+                            self._point_to_box_distance(point, candidate_box)
+                            for point in person_points
+                        ),
+                        default=float("inf"),
+                    ) >= 0.30 * width:
+                        continue
                 secondary_boxes.append(candidate_box)
 
         secondary_count = len(secondary_boxes)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         small = cv2.resize(gray, (max(1, width // 4), max(1, height // 4)))
+        current_person_boxes = [item[2] for item in detections]
         motion_found = False
         if (
             len(detections) == 1
@@ -367,17 +402,18 @@ class PoseLSTMDetector:
         ):
             difference = cv2.absdiff(self._last_gray, small)
             foreground_mask = np.full(small.shape, 255, dtype=np.uint8)
-            points, _, box = detections[0]
-            for _, _, person_box in detections:
-                x1 = max(0, int((person_box[0] - (person_box[2] - person_box[0]) * 0.1) / 4))
-                y1 = max(0, int((person_box[1] - (person_box[3] - person_box[1]) * 0.1) / 4))
+            for person_box in current_person_boxes + self._prev_person_boxes:
+                box_width = person_box[2] - person_box[0]
+                box_height = person_box[3] - person_box[1]
+                x1 = max(0, int((person_box[0] - box_width * 0.25) / 4))
+                y1 = max(0, int((person_box[1] - box_height * 0.25) / 4))
                 x2 = min(
                     small.shape[1],
-                    int((person_box[2] + (person_box[2] - person_box[0]) * 0.1) / 4),
+                    int((person_box[2] + box_width * 0.25) / 4),
                 )
                 y2 = min(
                     small.shape[0],
-                    int((person_box[3] + (person_box[3] - person_box[1]) * 0.1) / 4),
+                    int((person_box[3] + box_height * 0.25) / 4),
                 )
                 foreground_mask[y1:y2, x1:x2] = 0
             difference = cv2.bitwise_and(difference, difference, mask=foreground_mask)
@@ -391,6 +427,7 @@ class PoseLSTMDetector:
                 contours, _ = cv2.findContours(
                     motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
                 )
+                points = detections[0][0]
                 interaction_points = points[[9, 10, 15, 16]] * np.array(
                     [width, height], dtype=np.float32
                 )
@@ -416,6 +453,8 @@ class PoseLSTMDetector:
 
         if motion_found:
             secondary_count = max(secondary_count, 1)
+        if current_person_boxes:
+            self._prev_person_boxes = current_person_boxes
         self._last_gray = small
         self._last_frame_size = (width, height)
         self._secondary_boxes = secondary_boxes
@@ -475,6 +514,7 @@ class PoseLSTMDetector:
                 track.model_pose = np.clip(
                     track.model_pose + correction * time_scale, 0.0, 1.0
                 )
+                track.previous_bbox = track.bbox
                 previous_center_y = track.center_y
                 previous_aspect = track.aspect_ratio
                 track.center_y = float(self._center(box)[1] / max(frame_height, 1))
@@ -502,6 +542,7 @@ class PoseLSTMDetector:
                     bbox=box,
                     keypoints=points,
                     model_pose=points.copy(),
+                    previous_bbox=box,
                     last_detection_keypoints=points.copy(),
                     last_detection_time=now,
                     confidence=confidence,
@@ -623,7 +664,10 @@ class PoseLSTMDetector:
                     target = self._center(box) / np.array(
                         [max(frame_width, 1), max(frame_height, 1)]
                     )
-                    if np.linalg.norm(self._wrist_points(track) - target, axis=1).min() < 0.25:
+                    if (
+                        np.linalg.norm(self._wrist_points(track) - target, axis=1).min()
+                        < 0.25
+                    ):
                         proximity = 1.0
                         break
             if proximity == 0.0:
@@ -632,13 +676,47 @@ class PoseLSTMDetector:
         strike = max(item[0] for item in pair_scores)
         burst = max(item[1] for item in pair_scores)
         knockdown = max(item[2] for item in pair_scores)
-        return float(
+        score = float(
             np.clip(
                 0.35 * strike + 0.20 * burst + 0.30 * proximity + 0.15 * knockdown,
                 0.0,
                 1.0,
             )
         )
+        if person_count >= 2 and len(active_tracks) >= 2:
+            first, second = active_tracks[:2]
+            horizontal_gap = max(
+                0.0,
+                first.bbox[0] - second.bbox[2],
+                second.bbox[0] - first.bbox[2],
+            )
+            vertical_gap = max(
+                0.0,
+                first.bbox[1] - second.bbox[3],
+                second.bbox[1] - first.bbox[3],
+            )
+            min_box_gap = float(np.hypot(horizontal_gap, vertical_gap))
+            limb_distances = []
+            for source, target in ((first, second), (second, first)):
+                strike_points = source.keypoints[[9, 10, 15, 16]] * np.array(
+                    [max(frame_width, 1), max(frame_height, 1)], dtype=np.float32
+                )
+                limb_distances.extend(
+                    self._point_to_box_distance(point, target.bbox)
+                    for point in strike_points
+                )
+            min_limb_to_box_dist = min(limb_distances, default=float("inf"))
+            has_strong_strike = any(
+                strike_value >= 0.75 or burst_value >= 0.75
+                for strike_value, burst_value, _ in pair_scores
+            )
+            if (
+                min_box_gap > 0.25 * frame_width
+                and min_limb_to_box_dist > 0.28 * frame_width
+                and not has_strong_strike
+            ):
+                return min(score, 0.48)
+        return score
 
     def process_frame(self, frame: np.ndarray) -> ViolencePrediction:
         """Return a timestamped violence score for one BGR frame."""
@@ -653,7 +731,8 @@ class PoseLSTMDetector:
         )
         dt = max(elapsed, 0.02)
         frame_height, frame_width = frame.shape[:2]
-        if self._frame_index % self.pose_stride == 0:
+        is_pose_frame = self._frame_index % self.pose_stride == 0
+        if is_pose_frame:
             detections, secondary_count, _, secondary_boxes = self.detect_entities(frame)
             self._secondary_boxes = secondary_boxes
             self._secondary_count = secondary_count
@@ -680,6 +759,15 @@ class PoseLSTMDetector:
         self._last_frame_time = now
 
         person_count = len(tracks)
+        if person_count == 1 and secondary_count > 0:
+            self._secondary_persistence_frames += 1
+            if self._secondary_persistence_frames < 2:
+                secondary_count = 0
+        else:
+            self._secondary_persistence_frames = 0
+            if person_count == 1:
+                secondary_boxes = []
+
         active_tracks = sorted(tracks, key=lambda item: item.activity, reverse=True)[:2]
         onnx_probability = max(
             (self._track_probability(track) for track in active_tracks),
@@ -712,17 +800,30 @@ class PoseLSTMDetector:
                 )
             else:
                 probability = 0.85 * bio_score
-            if bio_score >= BIO_SCORE_FLOOR and probability >= self.threshold:
-                self._alert_hold_frames = ALERT_HOLD_FRAMES
-            elif bio_score >= BIO_SCORE_FLOOR and self._alert_hold_frames:
-                self._alert_hold_frames -= 1
-            else:
-                self._alert_hold_frames = 0
-            is_fighting = (
-                bio_score >= BIO_SCORE_FLOOR and self._alert_hold_frames > 0
+            required_triggers = (
+                2 if dt < 0.09 or person_count == 1 else 1
             )
+            required_bio_score = (
+                STRONG_BIO_SCORE_THRESHOLD
+                if dt >= 0.09 and person_count >= 2
+                else BIO_SCORE_FLOOR
+            )
+            if is_pose_frame:
+                if (
+                    bio_score >= required_bio_score
+                    and probability >= self.threshold
+                ):
+                    self._consecutive_triggers += 1
+                else:
+                    self._consecutive_triggers = 0
+                if self._consecutive_triggers >= required_triggers:
+                    self._alert_hold_frames = ALERT_HOLD_FRAMES
+                elif self._alert_hold_frames:
+                    self._alert_hold_frames -= 1
+            is_fighting = self._alert_hold_frames > 0
         else:
             probability = min(onnx_probability, 0.249)
+            self._consecutive_triggers = 0
             self._alert_hold_frames = 0
             is_fighting = False
 
@@ -763,9 +864,12 @@ class PoseLSTMDetector:
             self._next_track_id = 1
             self._last_gray = None
             self._last_frame_size = None
+            self._prev_person_boxes.clear()
             self._secondary_boxes.clear()
             self._secondary_count = 0
+            self._secondary_persistence_frames = 0
             self._alert_hold_frames = 0
+            self._consecutive_triggers = 0
             self._last_frame_time = None
             self._fps = 0.0
 
