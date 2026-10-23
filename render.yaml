@@ -10,8 +10,18 @@ services:
       - key: STREAM_SOURCE
         value: idle
       - key: FRAME_FPS
-        value: "8"
+        value: "15"
       - key: ONNX_INTRA_OP_THREADS
         value: "1"
+      - key: ORT_THREADS
+        value: "1"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: POSE_STRIDE
+        value: "2"
       - key: VIOLENCE_THRESHOLD
         value: "0.85"

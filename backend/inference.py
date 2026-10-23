@@ -15,6 +15,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
+cv2.setNumThreads(1)
+
 logger = logging.getLogger("inference")
 
 SEQUENCE_LENGTH = 30
@@ -26,6 +28,7 @@ POSE_CONFIDENCE = 0.25
 POSE_NMS_THRESHOLD = 0.45
 VIOLENCE_THRESHOLD = 0.75
 CONSECUTIVE_TRIGGERS_REQUIRED = 3
+POSE_STRIDE = max(1, int(os.environ.get("POSE_STRIDE", "2")))
 
 
 class Severity(IntEnum):
@@ -85,15 +88,24 @@ class PoseLSTMDetector:
             if not model_path.is_file():
                 raise FileNotFoundError(f"Required ONNX model not found: {model_path}")
 
-        threads = intra_op_threads or int(os.environ.get("ONNX_INTRA_OP_THREADS", "1"))
+        threads = (
+            intra_op_threads
+            if intra_op_threads is not None
+            else int(
+                os.environ.get(
+                    "ORT_THREADS", os.environ.get("ONNX_INTRA_OP_THREADS", "1")
+                )
+            )
+        )
         if threads < 1:
             raise ValueError("ONNX intra-op thread count must be at least one.")
+        self.intra_op_threads = threads
         options = ort.SessionOptions()
         options.intra_op_num_threads = threads
         options.inter_op_num_threads = 1
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        options.enable_cpu_mem_arena = False
+        options.enable_cpu_mem_arena = True
 
         self.pose_session = ort.InferenceSession(
             str(self.pose_model_path),
@@ -119,6 +131,14 @@ class PoseLSTMDetector:
         self.output_name = classifier_outputs[0].name
         self._poses: deque[np.ndarray] = deque(maxlen=SEQUENCE_LENGTH)
         self.consecutive_triggers = 0
+        self.pose_stride = POSE_STRIDE
+        self._frame_index = 0
+        self._frames_since_detection = 0
+        self._cached_pose = np.zeros(FEATURE_COUNT, dtype=np.float32)
+        self._last_detected_pose: Optional[np.ndarray] = None
+        self._pose_velocity = np.zeros(FEATURE_COUNT, dtype=np.float32)
+        self._cached_confidence = 0.0
+        self._cached_bbox: Optional[tuple[float, float, float, float]] = None
         self._last_frame_time: Optional[float] = None
         self._fps = 0.0
         self._lock = threading.Lock()
@@ -137,7 +157,7 @@ class PoseLSTMDetector:
         resized_width = round(width * scale)
         resized_height = round(height * scale)
         resized = cv2.resize(
-            frame, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR
+            frame, (resized_width, resized_height), interpolation=cv2.INTER_NEAREST
         )
         pad_x = (POSE_IMAGE_SIZE - resized_width) // 2
         pad_y = (POSE_IMAGE_SIZE - resized_height) // 2
@@ -230,7 +250,25 @@ class PoseLSTMDetector:
     def _process_frame(self, frame: np.ndarray) -> ViolencePrediction:
         started = time.perf_counter()
         now = time.time()
-        pose, confidence, bbox = self._extract_largest_person(frame)
+        self._frames_since_detection += 1
+        if self._frame_index % self.pose_stride == 0:
+            pose, confidence, bbox = self._extract_largest_person(frame)
+            if self._last_detected_pose is not None and self._frames_since_detection:
+                self._pose_velocity = (
+                    pose - self._last_detected_pose
+                ) / self._frames_since_detection
+            self._last_detected_pose = pose.copy()
+            self._cached_pose = pose.copy()
+            self._cached_confidence = confidence
+            self._cached_bbox = bbox
+            self._frames_since_detection = 0
+        else:
+            self._cached_pose = self._cached_pose + 0.5 * self._pose_velocity
+            self._cached_pose = np.clip(self._cached_pose, 0.0, 1.0)
+            pose = self._cached_pose.copy()
+            confidence = self._cached_confidence
+            bbox = self._cached_bbox
+        self._frame_index += 1
         self._poses.append(pose)
         if self._last_frame_time is not None:
             elapsed = now - self._last_frame_time
@@ -284,6 +322,13 @@ class PoseLSTMDetector:
         with self._lock:
             self._poses.clear()
             self.consecutive_triggers = 0
+            self._frame_index = 0
+            self._frames_since_detection = 0
+            self._cached_pose.fill(0.0)
+            self._last_detected_pose = None
+            self._pose_velocity.fill(0.0)
+            self._cached_confidence = 0.0
+            self._cached_bbox = None
             self._last_frame_time = None
             self._fps = 0.0
 

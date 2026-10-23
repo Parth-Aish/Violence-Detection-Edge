@@ -35,13 +35,16 @@ from ingest import (
 from logger import IncidentLogger
 
 
+cv2.setNumThreads(1)
+
 STREAM_SOURCE = os.getenv("STREAM_SOURCE", "idle")
 FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "640"))
 FRAME_HEIGHT = int(os.getenv("FRAME_HEIGHT", "480"))
 FRAME_FPS = max(
     1, min(int(os.getenv("FRAME_FPS", str(MAX_INGEST_FPS))), MAX_INGEST_FPS)
 )
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "70"))
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "60"))
+MAX_STREAM_WIDTH = 480
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -187,8 +190,16 @@ def _annotate_frame(frame: np.ndarray, prediction: ViolencePrediction) -> np.nda
 
 
 def _jpeg_base64(frame: np.ndarray) -> str:
+    height, width = frame.shape[:2]
+    if width > MAX_STREAM_WIDTH:
+        resized_height = max(1, round(height * MAX_STREAM_WIDTH / width))
+        frame = cv2.resize(
+            frame,
+            (MAX_STREAM_WIDTH, resized_height),
+            interpolation=cv2.INTER_AREA,
+        )
     success, buffer = cv2.imencode(
-        ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+        ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
     )
     if not success:
         raise RuntimeError("OpenCV failed to encode a WebSocket frame.")
@@ -318,6 +329,8 @@ async def health_check() -> dict:
         "max_ingest_fps": MAX_INGEST_FPS,
         "violence_threshold": _classifier.threshold if _classifier else None,
         "consecutive_triggers_required": CONSECUTIVE_TRIGGERS_REQUIRED,
+        "pose_stride": _classifier.pose_stride if _classifier else None,
+        "ort_threads": _classifier.intra_op_threads if _classifier else None,
         "ingestion_alive": bool(_producer_task and not _producer_task.done()),
         "model": str(_classifier.model_path) if _classifier else None,
         "pose_model": str(_classifier.pose_model_path) if _classifier else None,

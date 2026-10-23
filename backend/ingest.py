@@ -11,6 +11,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
+cv2.setNumThreads(1)
+
 logger = logging.getLogger("ingest")
 
 MAX_INGEST_FPS = 15
