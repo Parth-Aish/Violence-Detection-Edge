@@ -24,4 +24,4 @@ services:
       - key: POSE_STRIDE
         value: "2"
       - key: VIOLENCE_THRESHOLD
-        value: "0.85"
+        value: "0.58"

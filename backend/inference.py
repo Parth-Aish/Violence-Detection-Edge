@@ -14,6 +14,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+from pose_features import normalize_pose_sequence
 
 cv2.setNumThreads(1)
 
@@ -26,9 +27,10 @@ FEATURE_COUNT = KEYPOINT_COUNT * 2
 POSE_IMAGE_SIZE = 320
 POSE_CONFIDENCE = 0.25
 PRIMARY_PERSON_CONFIDENCE = 0.30
-SECONDARY_PROPOSAL_CONFIDENCE = 0.12
+SECONDARY_PROPOSAL_CONFIDENCE = 0.18
 POSE_NMS_THRESHOLD = 0.45
-VIOLENCE_THRESHOLD = 0.75
+VIOLENCE_THRESHOLD = 0.58
+BIO_SCORE_FLOOR = 0.56
 ALERT_HOLD_FRAMES = 4
 POSE_STRIDE = max(1, int(os.environ.get("POSE_STRIDE", "2")))
 
@@ -358,19 +360,24 @@ class PoseLSTMDetector:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         small = cv2.resize(gray, (max(1, width // 4), max(1, height // 4)))
         motion_found = False
-        if self._last_gray is not None and self._last_gray.shape == small.shape and detections:
+        if (
+            len(detections) == 1
+            and self._last_gray is not None
+            and self._last_gray.shape == small.shape
+        ):
             difference = cv2.absdiff(self._last_gray, small)
             foreground_mask = np.full(small.shape, 255, dtype=np.uint8)
-            for _, _, box in detections:
-                x1 = max(0, int((box[0] - (box[2] - box[0]) * 0.1) / 4))
-                y1 = max(0, int((box[1] - (box[3] - box[1]) * 0.1) / 4))
+            points, _, box = detections[0]
+            for _, _, person_box in detections:
+                x1 = max(0, int((person_box[0] - (person_box[2] - person_box[0]) * 0.1) / 4))
+                y1 = max(0, int((person_box[1] - (person_box[3] - person_box[1]) * 0.1) / 4))
                 x2 = min(
                     small.shape[1],
-                    int((box[2] + (box[2] - box[0]) * 0.1) / 4),
+                    int((person_box[2] + (person_box[2] - person_box[0]) * 0.1) / 4),
                 )
                 y2 = min(
                     small.shape[0],
-                    int((box[3] + (box[3] - box[1]) * 0.1) / 4),
+                    int((person_box[3] + (person_box[3] - person_box[1]) * 0.1) / 4),
                 )
                 foreground_mask[y1:y2, x1:x2] = 0
             difference = cv2.bitwise_and(difference, difference, mask=foreground_mask)
@@ -378,29 +385,34 @@ class PoseLSTMDetector:
             motion = cv2.morphologyEx(
                 motion, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8)
             )
-            contours, _ = cv2.findContours(
-                motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
             small_area = small.shape[0] * small.shape[1]
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area <= small_area * 0.03:
-                    continue
-                moment = cv2.moments(contour)
-                if moment["m00"] == 0:
-                    continue
-                cx = moment["m10"] / moment["m00"] * 4
-                cy = moment["m01"] / moment["m00"] * 4
-                if any(
-                    min(
-                        np.hypot(cx - box[0], cy - box[1]),
-                        np.hypot(cx - box[2], cy - box[3]),
+            motion_coverage = float(np.count_nonzero(motion)) / max(small_area, 1)
+            if motion_coverage <= 0.25:
+                contours, _ = cv2.findContours(
+                    motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                interaction_points = points[[9, 10, 15, 16]] * np.array(
+                    [width, height], dtype=np.float32
+                )
+                for contour in contours:
+                    area_ratio = cv2.contourArea(contour) / max(small_area, 1)
+                    if not 0.03 <= area_ratio <= 0.25:
+                        continue
+                    x, y, contour_width, contour_height = cv2.boundingRect(contour)
+                    contour_box = (
+                        x * 4,
+                        y * 4,
+                        (x + contour_width) * 4,
+                        (y + contour_height) * 4,
                     )
-                    <= max(width, height) * 0.35
-                    for _, _, box in detections
-                ):
-                    motion_found = True
-                    break
+                    distances = []
+                    for px, py in interaction_points:
+                        dx = max(contour_box[0] - px, 0.0, px - contour_box[2])
+                        dy = max(contour_box[1] - py, 0.0, py - contour_box[3])
+                        distances.append(float(np.hypot(dx, dy)))
+                    if min(distances, default=float("inf")) < 0.30 * width:
+                        motion_found = True
+                        break
 
         if motion_found:
             secondary_count = max(secondary_count, 1)
@@ -542,7 +554,9 @@ class PoseLSTMDetector:
         sequence = list(track.history)
         if len(sequence) < SEQUENCE_LENGTH:
             sequence = [sequence[0]] * (SEQUENCE_LENGTH - len(sequence)) + sequence
-        model_input = np.asarray(sequence[-SEQUENCE_LENGTH:], dtype=np.float32)
+        model_input = normalize_pose_sequence(
+            np.asarray(sequence[-SEQUENCE_LENGTH:], dtype=np.float32)
+        )
         output = self.session.run(
             [self.output_name],
             {self.input_name: model_input[np.newaxis, :, :]},
@@ -691,15 +705,22 @@ class PoseLSTMDetector:
             frame_height=frame_height,
         )
         if interaction_active:
-            probability = max(
-                onnx_probability,
-                0.65 * bio_score + 0.35 * onnx_probability,
-            )
-            if probability >= 0.58:
+            if bio_score >= BIO_SCORE_FLOOR:
+                probability = max(
+                    bio_score,
+                    0.75 * bio_score + 0.25 * onnx_probability,
+                )
+            else:
+                probability = 0.85 * bio_score
+            if bio_score >= BIO_SCORE_FLOOR and probability >= self.threshold:
                 self._alert_hold_frames = ALERT_HOLD_FRAMES
-            elif self._alert_hold_frames:
+            elif bio_score >= BIO_SCORE_FLOOR and self._alert_hold_frames:
                 self._alert_hold_frames -= 1
-            is_fighting = self._alert_hold_frames > 0
+            else:
+                self._alert_hold_frames = 0
+            is_fighting = (
+                bio_score >= BIO_SCORE_FLOOR and self._alert_hold_frames > 0
+            )
         else:
             probability = min(onnx_probability, 0.249)
             self._alert_hold_frames = 0

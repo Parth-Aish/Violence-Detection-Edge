@@ -20,7 +20,9 @@ from torch.utils.data import DataLoader, TensorDataset
 ROOT = Path(__file__).resolve().parent
 SEQUENCE_LENGTH = 30
 FEATURES = 34
-OPERATIONAL_THRESHOLD = 0.75
+OPERATIONAL_THRESHOLD = 0.58
+sys.path.insert(0, str(ROOT / "backend"))
+from pose_features import normalize_pose_batch
 
 
 class ViolenceLSTM(nn.Module):
@@ -58,6 +60,35 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def augment_temporal_windows(
+    sequences: np.ndarray, rng: np.random.Generator
+) -> np.ndarray:
+    """Resample random 10–20 frame windows to train on reduced input rates."""
+    augmented = np.empty_like(sequences, dtype=np.float32)
+    for index, sequence in enumerate(sequences):
+        valid_frames = np.flatnonzero(np.any(sequence != 0.0, axis=1))
+        if valid_frames.size == 0:
+            augmented[index] = sequence
+            continue
+        first = int(valid_frames[0])
+        last = int(valid_frames[-1]) + 1
+        available = last - first
+        window_length = min(available, int(rng.integers(10, 21)))
+        start = int(rng.integers(first, last - window_length + 1))
+        window = sequence[start : start + window_length]
+        source_positions = np.arange(window_length, dtype=np.float32)
+        target_positions = np.linspace(
+            0.0, max(window_length - 1, 0), num=SEQUENCE_LENGTH, dtype=np.float32
+        )
+        for feature_index in range(FEATURES):
+            augmented[index, :, feature_index] = np.interp(
+                target_positions,
+                source_positions,
+                window[:, feature_index],
+            )
+    return augmented
 
 
 def export_onnx(model: ViolenceLSTM, destination: Path) -> None:
@@ -101,6 +132,7 @@ def train(args: argparse.Namespace) -> dict[str, float]:
         )
     if not np.isfinite(x).all():
         raise ValueError("Feature array contains NaN or infinite values.")
+    x = normalize_pose_batch(x)
 
     indices = np.arange(len(y))
     test_count = max(2, math.ceil(len(y) * 0.2))
@@ -116,15 +148,6 @@ def train(args: argparse.Namespace) -> dict[str, float]:
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     x_tensor = torch.from_numpy(x)
     y_tensor = torch.from_numpy(y.astype(np.float32, copy=False))
-    train_dataset = TensorDataset(x_tensor[train_indices], y_tensor[train_indices])
-    generator = torch.Generator().manual_seed(args.seed)
-    loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        generator=generator,
-    )
-
     model = ViolenceLSTM().to(device)
     positive_count = int(np.sum(y[train_indices] == 1))
     negative_count = int(np.sum(y[train_indices] == 0))
@@ -133,7 +156,27 @@ def train(args: argparse.Namespace) -> dict[str, float]:
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
+    augmentation_rng = np.random.default_rng(args.seed)
     for epoch in range(args.epochs):
+        epoch_sequences = np.concatenate(
+            (
+                x[train_indices],
+                augment_temporal_windows(x[train_indices], augmentation_rng),
+            ),
+            axis=0,
+        )
+        epoch_labels = np.concatenate((y[train_indices], y[train_indices]))
+        epoch_dataset = TensorDataset(
+            torch.from_numpy(epoch_sequences),
+            torch.from_numpy(epoch_labels.astype(np.float32, copy=False)),
+        )
+        generator = torch.Generator().manual_seed(args.seed + epoch)
+        loader = DataLoader(
+            epoch_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            generator=generator,
+        )
         model.train()
         total_loss = 0.0
         examples = 0

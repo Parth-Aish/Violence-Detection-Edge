@@ -1,8 +1,8 @@
 # Pose-Based Spatio-Temporal Violence Detection
 
-This repository contains a train-to-deploy video classification pipeline. An exported YOLOv8-Pose ONNX model extracts 17 body keypoints per frame; a single-layer, 64-unit LSTM ONNX model classifies 30-frame sequences of normalized x/y coordinates (34 features per frame). The production backend uses ONNX Runtime and OpenCV only for inference; it does not install PyTorch or Ultralytics. The backend uses a default probability threshold of `0.75` and emits a positive violence decision only after three consecutive above-threshold inference results.
+This repository contains a train-to-deploy video classification pipeline. An exported YOLOv8-Pose ONNX model extracts 17 body keypoints per frame; a single-layer, 64-unit LSTM ONNX model classifies 30-frame sequences of shared root-centered pose and velocity features (34 features per frame). The production backend uses ONNX Runtime and OpenCV only for inference; it does not install PyTorch or Ultralytics. Violence alerts require an active multi-entity scene, a biomechanical score of at least `0.56`, and a fused score of at least `0.58`.
 
-The project accepts browser webcam, RTSP/RTSPS, and MP4 sources. The browser captures webcam frames through `getUserMedia` and sends them over `/ws/stream`; cloud servers do not attempt to open a local camera device. Local ingestion defaults to 15 FPS with an asyncio queue bounded to 30 frames. The classifier uses a default probability threshold of `0.75` and requires three consecutive above-threshold inference results before raising a violence alert. Pose inference runs every second frame by default, with intermediate keypoints extrapolated from observed motion. Render pins numerical-library and ONNX Runtime threads to one, uses a 15 FPS ingestion cap, `POSE_STRIDE=2`, and `VIOLENCE_THRESHOLD=0.85`. WebSocket previews are resized to at most 480 pixels wide and encoded as JPEG at quality 60. Incident timestamps, probability, severity, FPS, and inference latency are logged to SQLite and JSONL.
+The project accepts browser webcam, RTSP/RTSPS, and MP4 sources. The browser captures webcam frames through `getUserMedia` and sends them over `/ws/stream`; cloud servers do not attempt to open a local camera device. Local ingestion defaults to 15 FPS with an asyncio queue bounded to two frames. Pose inference runs every second frame by default, with intermediate keypoints extrapolated from observed motion. Render pins numerical-library and ONNX Runtime threads to one, uses a 15 FPS ingestion cap, `POSE_STRIDE=2`, and `VIOLENCE_THRESHOLD=0.58`. WebSocket previews are resized to at most 480 pixels wide and encoded as JPEG at quality 60. Incident timestamps, probability, severity, FPS, and inference latency are logged to SQLite and JSONL.
 
 ## Data and model workflow
 
@@ -53,7 +53,7 @@ python -c "from ultralytics import YOLO; YOLO('yolov8n-pose.pt').export(format='
 python -c "from pathlib import Path; Path('yolov8n-pose.onnx').replace('backend/yolov8n-pose.onnx')"
 ```
 
-This creates `backend/yolov8n-pose.onnx`. Training uses a stratified 80/20 split and prints held-out precision, recall, and F1 at the `> 0.75` probability threshold, plus reference metrics at `0.50`. The training report evaluates individual sequences and does not model the online three-consecutive-result debounce. Both ONNX files are required to start the inference backend and build the Docker image.
+This creates `backend/yolov8n-pose.onnx`. Training uses a stratified 80/20 split, applies the same root-centered pose/velocity normalization as inference, and augments training data with resampled 10–20 frame temporal windows. It prints held-out precision, recall, and F1 at the `0.58` classifier probability threshold, plus reference metrics at `0.50`. Both ONNX files are required to start the inference backend and build the Docker image.
 
 ## Run locally
 
@@ -92,7 +92,10 @@ Open `http://localhost:3000`. Use the Webcam control for camera index zero, uplo
   "fps": 9.8,
   "inference_ms": 42.1,
   "latency_ms": 42.1,
-  "timestamp": 1792685082.84
+  "timestamp": 1792685082.84,
+  "person_count": 2,
+  "entity_count": 2,
+  "interaction_mode": "2+ Persons"
 }
 ```
 
@@ -102,7 +105,7 @@ Available endpoints:
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/health` | Backend, ingestion, violence threshold, debounce, pose stride, and ONNX thread configuration |
+| `GET` | `/api/health` | Backend, ingestion, violence threshold, alert hold, pose stride, and ONNX thread configuration |
 | `GET` | `/api/incidents` | Recent SQLite incidents |
 | `GET` | `/api/stats` | Severity counts |
 | `POST` | `/api/source/webcam` (`/source/webcam` alias) | Stop server-side ingestion and prepare for browser webcam frames |
@@ -125,14 +128,14 @@ Available endpoints:
 | `MAX_UPLOAD_BYTES` | `104857600` | Maximum uploaded video size |
 | `JPEG_QUALITY` | `60` | WebSocket JPEG quality |
 | `PORT` | `7860` | FastAPI listen port locally; Render supplies its port |
-| `VIOLENCE_THRESHOLD` | `0.75` | Strict classifier decision threshold (`probability > threshold`); requires three consecutive triggers; Render Blueprint overrides to `0.85` |
+| `VIOLENCE_THRESHOLD` | `0.58` | Fused violence decision threshold; alerts also require a biomechanical score of at least `0.56` and an active multi-entity scene |
 | `ORT_THREADS` | `1` | ONNX Runtime intra-op threads per session |
 
 ## Evidence and limitations
 
-The trained ONNX artifact was produced from 2,000 downloaded videos (1,000 per class), with a stratified 400-sequence test split. Raw, per-sequence measurements at thresholds `> 0.85`, `> 0.65`, and `0.50` yielded held-out precision/recall/F1 of 1.000/0.330/0.496, 0.944/0.670/0.784, and 0.847/0.775/0.809, respectively. These historical threshold-only results do not evaluate the current `> 0.75` threshold combined with the three-consecutive-result debounce. A stride-two simulation on that same split changed precision/recall/F1 at `> 0.75` from 0.952/0.500/0.656 to 0.971/0.495/0.656; at the Render threshold `> 0.85`, accuracy changed from 0.665 to 0.6475 and recall from 0.330 to 0.295, with precision remaining 1.000. This is a keypoint-array simulation, not end-to-end validation, and indicates a small measured degradation at the existing Render threshold. On one local 66-frame clip, measured detector processing averaged 31.98 ms/frame at stride one and 16.75 ms/frame at stride two. Neither result predicts Render performance: the single-clip test ran on an Intel Core i5-1135G7, while the reported 15.89 FPS baseline preceded stride optimization. Historical logs and synthetic benchmark measurements belong to the earlier velocity-heuristic prototype and are not LSTM results. See [paper/paper.md](paper/paper.md) for scope and limitations.
+The latest full-data export trained for 30 epochs with seed 42 and achieved held-out precision/recall/F1 of 0.891/0.895/0.893 at `> 0.58` on a stratified 400-sequence split. A separate candidate trained with all 15 listed videos excluded was tested end-to-end at simulated 6 FPS: it detected 6/8 violence clips and correctly cleared 6/7 non-violence clips (clip-level recall 0.75 and specificity 0.857). It detected all three requested `V_1`–`V_3` clips and raised no alerts on `NV_1` or `NV_2`. The production export was subsequently retrained on all 2,000 sequences, including those 15 clips, so these end-to-end results apply only to the excluded-clip candidate, not the final production weights. The 15-clip sample is limited and not an independent deployment certification. Single-clip latency measurements and historical velocity-heuristic logs are not current violence accuracy measures. See [paper/paper.md](paper/paper.md) for methodology and limitations.
 
-The implementation selects the highest-confidence person independently in each frame and represents missing poses with zero coordinates. Multiple-person identity switches, camera motion, occlusion, non-violent high-motion activity, and threshold calibration require testing on representative labeled footage before operational use.
+The runtime tracks up to four people, scores the two most active tracks, and only treats localized proposals or nearby compact motion as secondary entities for a one-person scene. The 15 held-out clip benchmark is small and should not be treated as broad validation; identity switches, camera motion, occlusion, and non-violent high-motion scenes still require evaluation on more representative footage.
 
 ## Render deployment
 
