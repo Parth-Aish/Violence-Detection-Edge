@@ -1,0 +1,62 @@
+{
+  "total_evaluated": 10,
+  "violence_count": 5,
+  "non_violence_count": 5,
+  "confusion_matrix": {
+    "tn": 5,
+    "fp": 0,
+    "fn": 2,
+    "tp": 3,
+    "matrix_2x2": [
+      [
+        5,
+        0
+      ],
+      [
+        2,
+        3
+      ]
+    ]
+  },
+  "metrics": {
+    "accuracy": 0.8,
+    "precision": 1.0,
+    "recall": 0.6,
+    "specificity": 1.0,
+    "f1_score": 0.75,
+    "average_fps": 49.5,
+    "total_frames": 1222,
+    "total_processing_time_sec": 24.99
+  },
+  "misclassified_count": 2,
+  "misclassified": [
+    {
+      "filename": "V_2.mp4",
+      "relative_path": "raw\\Violence\\V_2.mp4",
+      "ground_truth": "Violence",
+      "predicted_verdict": "Safe",
+      "confidence": 0.908,
+      "peak_probability": 0.092,
+      "is_correct": false,
+      "incident_count": 0,
+      "frame_count": 115,
+      "video_duration_sec": 6.9,
+      "processing_time_sec": 2.62,
+      "fps": 43.9
+    },
+    {
+      "filename": "V_5.mp4",
+      "relative_path": "raw\\Violence\\V_5.mp4",
+      "ground_truth": "Violence",
+      "predicted_verdict": "Safe",
+      "confidence": 0.381,
+      "peak_probability": 0.619,
+      "is_correct": false,
+      "incident_count": 0,
+      "frame_count": 114,
+      "video_duration_sec": 5.85,
+      "processing_time_sec": 2.54,
+      "fps": 44.9
+    }
+  ]
+}

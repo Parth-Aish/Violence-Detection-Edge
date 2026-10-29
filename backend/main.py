@@ -1,56 +1,43 @@
-"""Async FastAPI service for ONNX violence inference and video ingestion."""
+"""FastAPI backend service for batch video analysis and model inference."""
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
-import json
 import logging
 import os
+import shutil
+import sys
 import tempfile
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urlsplit
+from typing import Any, Optional
 
 import cv2
-import numpy as np
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from inference import (
+# Ensure backend directory is in sys.path
+_backend_dir = str(Path(__file__).resolve().parent)
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+
+from core.inference import (
     ALERT_HOLD_FRAMES,
     CONSECUTIVE_TRIGGERS_REQUIRED,
+    DEFAULT_POSE_STRIDE,
+    POSE_STRIDE,
     PoseLSTMDetector,
-    ViolencePrediction,
-)
-from ingest import (
-    MAX_INGEST_FPS,
-    create_frame_queue,
-    open_video_source,
-    produce_frames,
+    PoseSTGCNDetector,
 )
 from logger import IncidentLogger
 
-
 cv2.setNumThreads(1)
 
-STREAM_SOURCE = os.getenv("STREAM_SOURCE", "idle")
-FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "640"))
-FRAME_HEIGHT = int(os.getenv("FRAME_HEIGHT", "480"))
-FRAME_FPS = max(
-    1, min(int(os.getenv("FRAME_FPS", str(MAX_INGEST_FPS))), MAX_INGEST_FPS)
-)
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "60"))
-MAX_STREAM_WIDTH = 480
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
-MAX_CLIENT_FRAME_BYTES = 5 * 1024 * 1024
-MAX_CLIENT_FRAME_PIXELS = 1920 * 1080
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(150 * 1024 * 1024)))
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -58,588 +45,254 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-_frame_queue: Optional[asyncio.Queue[np.ndarray]] = None
-_producer_stop: Optional[asyncio.Event] = None
-_producer_task: Optional[asyncio.Task] = None
 _classifier: Optional[PoseLSTMDetector] = None
 _incident_logger: Optional[IncidentLogger] = None
-_inference_task: Optional[asyncio.Task] = None
-_active_upload_path: Optional[Path] = None
-_active_source_type = "idle"
-_source_generation = 0
-
-_ws_clients: set[WebSocket] = set()
-_ws_send_locks: dict[WebSocket, asyncio.Lock] = {}
-_ws_lock = asyncio.Lock()
-_source_lock = asyncio.Lock()
+_analysis_lock = asyncio.Lock()
 
 
-class RTSPSourceRequest(BaseModel):
-    source: str = Field(min_length=8, max_length=2048)
+def resolve_sample_video(sample_name: str) -> Path:
+    """Locate a sample video in raw data directories or frontend public samples."""
+    clean_name = sample_name.strip().strip("'\"")
+    direct = Path(clean_name)
+    if direct.is_file():
+        return direct.resolve()
 
+    project_root = Path(__file__).resolve().parent.parent
+    raw_dir = project_root / "data" / "raw"
+    public_samples_dir = project_root / "frontend" / "public" / "samples"
 
-def _source_type(source: str, uploaded: bool = False) -> str:
-    if uploaded:
-        return "upload"
-    if source.isdigit():
-        return "webcam"
-    if source.lower().startswith(("rtsp://", "rtsps://")):
-        return "rtsp"
-    if source.lower() in {"", "idle"}:
-        return "idle"
-    return "file"
+    candidates = [clean_name]
+    if not clean_name.lower().endswith((".mp4", ".avi")):
+        candidates.append(f"{clean_name}.mp4")
 
+    for name in candidates:
+        p_raw = raw_dir / name
+        if p_raw.is_file():
+            return p_raw.resolve()
+        p_nv = raw_dir / "NonViolence" / name
+        if p_nv.is_file():
+            return p_nv.resolve()
+        p_v = raw_dir / "Violence" / name
+        if p_v.is_file():
+            return p_v.resolve()
+        p_pub = public_samples_dir / name
+        if p_pub.is_file():
+            return p_pub.resolve()
 
-async def _stop_producer() -> None:
-    global _producer_task, _producer_stop
-    if _producer_stop is not None:
-        _producer_stop.set()
-    if _producer_task is not None:
-        _producer_task.cancel()
-        try:
-            await _producer_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            log.exception("Video producer stopped after an error.")
-        _producer_task = None
-    _producer_stop = None
+    for search_dir in [raw_dir / "NonViolence", raw_dir / "Violence", public_samples_dir]:
+        if search_dir.is_dir():
+            for f in search_dir.glob("*.*"):
+                if (
+                    f.name.lower() == clean_name.lower()
+                    or f.stem.lower() == clean_name.lower()
+                ):
+                    return f.resolve()
 
-
-async def _swap_source(
-    source: str,
-    *,
-    loop_file: bool = False,
-    upload_path: Optional[Path] = None,
-) -> None:
-    global _frame_queue, _producer_stop, _producer_task
-    global _active_upload_path, _active_source_type, _source_generation
-
-    async with _source_lock:
-        capture = None
-        if _source_type(source) != "idle":
-            capture = await asyncio.to_thread(open_video_source, source)
-
-        old_upload_path = _active_upload_path
-        await _stop_producer()
-        _frame_queue = create_frame_queue()
-        _active_upload_path = upload_path
-        _active_source_type = _source_type(source, uploaded=upload_path is not None)
-        _source_generation += 1
-
-        if _classifier is not None:
-            _classifier.reset()
-        if capture is not None:
-            _producer_stop = asyncio.Event()
-            _producer_task = asyncio.create_task(
-                produce_frames(
-                    capture,
-                    _frame_queue,
-                    _producer_stop,
-                    source=source,
-                    width=FRAME_WIDTH,
-                    height=FRAME_HEIGHT,
-                    fps=FRAME_FPS,
-                    loop_file=loop_file,
-                ),
-                name="video-frame-producer",
-            )
-            _producer_task.add_done_callback(_report_producer_error)
-
-        if old_upload_path is not None and old_upload_path != upload_path:
-            old_upload_path.unlink(missing_ok=True)
-        log.info("Video source changed to %s", _active_source_type)
-
-
-async def _use_browser_webcam(source_type: str = "webcam") -> None:
-    global _frame_queue, _active_upload_path, _active_source_type, _source_generation
-
-    async with _source_lock:
-        old_upload_path = _active_upload_path
-        await _stop_producer()
-        _frame_queue = create_frame_queue()
-        _active_upload_path = None
-        _active_source_type = source_type
-        _source_generation += 1
-        if _classifier is not None:
-            _classifier.reset()
-        if old_upload_path is not None:
-            old_upload_path.unlink(missing_ok=True)
-        log.info("Stopped server ingestion; waiting for browser webcam frames")
-
-
-def _report_producer_error(task: asyncio.Task) -> None:
-    if task.cancelled():
-        return
-    error = task.exception()
-    if error is not None:
-        log.error(
-            "Video producer task failed.",
-            exc_info=(type(error), error, error.__traceback__),
-        )
-
-
-async def _broadcast(payload: dict) -> None:
-    if not _ws_clients:
-        return
-    encoded = json.dumps(payload)
-    async with _ws_lock:
-        for websocket in tuple(_ws_clients):
-            try:
-                await _send_websocket_text(websocket, encoded)
-            except (WebSocketDisconnect, RuntimeError, OSError):
-                _ws_clients.discard(websocket)
-
-
-async def _send_websocket_text(websocket: WebSocket, message: str) -> None:
-    send_lock = _ws_send_locks.get(websocket)
-    if send_lock is None:
-        return
-    async with send_lock:
-        await websocket.send_text(message)
-
-
-def _decode_client_frame(encoded: str) -> Optional[np.ndarray]:
-    if len(encoded) > MAX_CLIENT_FRAME_BYTES * 4 // 3 + 4:
-        raise ValueError("Client frame exceeds the maximum allowed size.")
-    try:
-        jpeg = base64.b64decode(encoded, validate=True)
-    except (ValueError, binascii.Error) as exc:
-        raise ValueError("Client frame is not valid base64.") from exc
-    if len(jpeg) > MAX_CLIENT_FRAME_BYTES:
-        raise ValueError("Client frame exceeds the maximum allowed size.")
-    frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if frame is None or frame.size == 0:
-        raise ValueError("Client frame is not a valid JPEG image.")
-    if frame.shape[0] * frame.shape[1] > MAX_CLIENT_FRAME_PIXELS:
-        raise ValueError("Client frame dimensions exceed the maximum allowed size.")
-    return frame
-
-
-async def _receive_websocket_messages(
-    websocket: WebSocket, frame_queue: asyncio.Queue[tuple[np.ndarray, int]]
-) -> None:
-    while True:
-        message = await websocket.receive_text()
-        try:
-            payload = json.loads(message)
-        except json.JSONDecodeError:
-            await _send_websocket_text(
-                websocket, json.dumps({"type": "error", "detail": "Invalid JSON"})
-            )
-            continue
-        if not isinstance(payload, dict):
-            await _send_websocket_text(
-                websocket, json.dumps({"type": "error", "detail": "Invalid message"})
-            )
-            continue
-        if payload.get("action") == "stop_server_stream":
-            if _classifier is None:
-                await _send_websocket_text(
-                    websocket,
-                    json.dumps(
-                        {"type": "error", "detail": "Inference model is not loaded."}
-                    ),
-                )
-                continue
-            await _use_browser_webcam(source_type="idle")
-            while True:
-                try:
-                    frame_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-            await _send_websocket_text(
-                websocket,
-                json.dumps({"type": "source", "source": "idle", "status": "stopped"}),
-            )
-            continue
-        if payload.get("type") == "ping":
-            await _send_websocket_text(
-                websocket, json.dumps({"type": "pong"})
-            )
-            continue
-        if payload.get("type") != "client_frame":
-            continue
-        if _active_source_type != "webcam":
-            await _send_websocket_text(
-                websocket,
-                json.dumps(
-                    {
-                        "type": "error",
-                        "detail": "Select browser webcam mode before sending camera frames.",
-                    }
-                ),
-            )
-            continue
-        encoded = payload.get("data")
-        if not isinstance(encoded, str):
-            await _send_websocket_text(
-                websocket,
-                json.dumps({"type": "error", "detail": "Frame data must be a base64 string."}),
-            )
-            continue
-        try:
-            frame = await asyncio.to_thread(_decode_client_frame, encoded)
-        except ValueError as exc:
-            await _send_websocket_text(
-                websocket, json.dumps({"type": "error", "detail": str(exc)})
-            )
-            continue
-        try:
-            frame_queue.put_nowait((frame, _source_generation))
-        except asyncio.QueueFull:
-            try:
-                frame_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            frame_queue.put_nowait((frame, _source_generation))
-
-
-async def _process_websocket_frames(
-    websocket: WebSocket, frame_queue: asyncio.Queue[tuple[np.ndarray, int]]
-) -> None:
-    frame_count = 0
-    rate_started = time.monotonic()
-    measured_fps = 0.0
-    while True:
-        frame, generation = await frame_queue.get()
-        if generation != _source_generation or _active_source_type != "webcam":
-            continue
-        if _classifier is None:
-            await _send_websocket_text(
-                websocket,
-                json.dumps({"type": "error", "detail": "Inference model is not loaded."}),
-            )
-            continue
-        try:
-            prediction = await asyncio.to_thread(_classifier.process_frame, frame)
-            if generation != _source_generation or _active_source_type != "webcam":
-                continue
-            frame_count += 1
-            elapsed = time.monotonic() - rate_started
-            if elapsed >= 1.0:
-                measured_fps = frame_count / elapsed
-                frame_count = 0
-                rate_started = time.monotonic()
-            if prediction.is_fighting and _incident_logger is not None:
-                record = await asyncio.to_thread(
-                    _incident_logger.log_prediction, prediction
-                )
-                if record:
-                    await _broadcast({"type": "incident", "data": record})
-
-            await _send_websocket_text(
-                websocket,
-                json.dumps(
-                    {
-                        "type": "frame",
-                        "data": _jpeg_base64(_annotate_frame(frame, prediction)),
-                        "is_violence": prediction.is_fighting,
-                        "probability": prediction.probability,
-                        "severity": prediction.severity.name,
-                        "fps": measured_fps or prediction.fps,
-                        "inference_ms": prediction.inference_ms,
-                        "latency_ms": prediction.inference_ms,
-                        "timestamp": prediction.timestamp,
-                        "person_count": prediction.person_count,
-                        "entity_count": prediction.entity_count,
-                        "secondary_entity_count": prediction.secondary_entity_count,
-                        "interaction_mode": prediction.interaction_mode,
-                    }
-                ),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("Client-frame inference or response failed.")
-            await _send_websocket_text(
-                websocket,
-                json.dumps({"type": "error", "detail": "Could not process client frame."}),
-            )
-
-
-def _annotate_frame(frame: np.ndarray, prediction: ViolencePrediction) -> np.ndarray:
-    annotated = frame.copy()
-    people = list(zip(prediction.person_boxes, prediction.person_keypoints))
-    if not people and prediction.keypoints is not None and prediction.bbox is not None:
-        people = [(prediction.bbox, prediction.keypoints)]
-    if people:
-        height, width = annotated.shape[:2]
-        color = (0, 0, 255) if prediction.is_fighting else (40, 180, 90)
-        for person_index, (bbox, keypoints) in enumerate(people):
-            points = np.asarray(keypoints).reshape(-1, 2)
-            valid = np.any(points > 0.0, axis=1)
-            pixel_points = np.column_stack(
-                (
-                    np.rint(points[:, 0] * width),
-                    np.rint(points[:, 1] * height),
-                )
-            ).astype(np.int32)
-            for start, end in (
-                (0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9),
-                (6, 8), (8, 10), (5, 11), (6, 12), (11, 12), (11, 13),
-                (13, 15), (12, 14), (14, 16),
-            ):
-                if valid[start] and valid[end]:
-                    cv2.line(
-                        annotated,
-                        tuple(pixel_points[start]),
-                        tuple(pixel_points[end]),
-                        color,
-                        2,
-                        cv2.LINE_AA,
-                    )
-            for index, point in enumerate(pixel_points):
-                if valid[index]:
-                    cv2.circle(
-                        annotated, tuple(point), 3, (255, 190, 70), -1, cv2.LINE_AA
-                    )
-            x1, y1, x2, y2 = (int(value) for value in bbox)
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            label = (
-                f"{prediction.severity.name} {prediction.probability:.2f}"
-                if person_index == 0
-                else f"Person {person_index + 1}"
-            )
-            cv2.putText(
-                annotated,
-                label,
-                (x1, max(20, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
-    return annotated
-
-
-def _jpeg_base64(frame: np.ndarray) -> str:
-    height, width = frame.shape[:2]
-    if width > MAX_STREAM_WIDTH:
-        resized_height = max(1, round(height * MAX_STREAM_WIDTH / width))
-        frame = cv2.resize(
-            frame,
-            (MAX_STREAM_WIDTH, resized_height),
-            interpolation=cv2.INTER_AREA,
-        )
-    success, buffer = cv2.imencode(
-        ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-    )
-    if not success:
-        raise RuntimeError("OpenCV failed to encode a WebSocket frame.")
-    return base64.b64encode(buffer).decode("ascii")
-
-
-async def _inference_loop() -> None:
-    global _frame_queue
-    frame_count = 0
-    rate_started = time.monotonic()
-    measured_fps = 0.0
-
-    while True:
-        frame_queue = _frame_queue
-        generation = _source_generation
-        if frame_queue is None:
-            await asyncio.sleep(0.1)
-            continue
-        try:
-            frame = await asyncio.wait_for(frame_queue.get(), timeout=1.0)
-        except asyncio.TimeoutError:
-            continue
-        if generation != _source_generation or _classifier is None:
-            continue
-
-        try:
-            prediction = await asyncio.to_thread(_classifier.process_frame, frame)
-            if generation != _source_generation:
-                continue
-
-            frame_count += 1
-            elapsed = time.monotonic() - rate_started
-            if elapsed >= 1.0:
-                measured_fps = frame_count / elapsed
-                frame_count = 0
-                rate_started = time.monotonic()
-
-            if _incident_logger is not None:
-                record = await asyncio.to_thread(
-                    _incident_logger.log_prediction, prediction
-                )
-                if record:
-                    await _broadcast({"type": "incident", "data": record})
-
-            await _broadcast(
-                {
-                    "type": "frame",
-                    "data": _jpeg_base64(_annotate_frame(frame, prediction)),
-                    "is_violence": prediction.is_fighting,
-                    "probability": prediction.probability,
-                    "severity": prediction.severity.name,
-                    "fps": measured_fps or prediction.fps,
-                    "inference_ms": prediction.inference_ms,
-                    "latency_ms": prediction.inference_ms,
-                    "timestamp": prediction.timestamp,
-                    "person_count": prediction.person_count,
-                    "entity_count": prediction.entity_count,
-                    "secondary_entity_count": prediction.secondary_entity_count,
-                    "interaction_mode": prediction.interaction_mode,
-                }
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("Frame inference or broadcast failed.")
-            await asyncio.sleep(0.05)
+    raise FileNotFoundError(f"Sample video '{sample_name}' not found in samples or raw data.")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global _classifier, _incident_logger, _inference_task, _frame_queue
-    global _active_source_type
-
-    log.info(
-        "Starting ONNX pose/LSTM detection at %dx%d and at most %d FPS",
-        FRAME_WIDTH,
-        FRAME_HEIGHT,
-        FRAME_FPS,
-    )
-    _classifier = PoseLSTMDetector()
+    global _classifier, _incident_logger
+    log.info("Initializing Pose + ST-GCN Batch Inference Service...")
+    _classifier = PoseSTGCNDetector()
     _incident_logger = IncidentLogger()
-    _frame_queue = create_frame_queue()
-    _active_source_type = "idle"
-    if _source_type(STREAM_SOURCE) != "idle":
-        await _swap_source(STREAM_SOURCE, loop_file=True)
-    _inference_task = asyncio.create_task(_inference_loop(), name="frame-inference")
-
+    log.info("Model loaded successfully. Ready for batch analysis.")
     try:
         yield
     finally:
-        if _inference_task is not None:
-            _inference_task.cancel()
-            try:
-                await _inference_task
-            except asyncio.CancelledError:
-                pass
-            _inference_task = None
-        await _stop_producer()
-        if _active_upload_path is not None:
-            _active_upload_path.unlink(missing_ok=True)
-        async with _ws_lock:
-            for websocket in tuple(_ws_clients):
-                try:
-                    await websocket.close()
-                except (WebSocketDisconnect, RuntimeError, OSError):
-                    pass
-            _ws_clients.clear()
+        log.info("Shutting down inference service...")
         _classifier = None
         _incident_logger = None
 
 
 app = FastAPI(
-    title="Spatio-Temporal Violence Detection",
-    version="3.0.0",
+    title="AI Video Kinematics & Incident Analysis Service",
+    version="4.0.0",
     lifespan=lifespan,
 )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
 @app.get("/api/health")
-async def health_check() -> dict:
+async def health_check() -> dict[str, Any]:
     return {
         "status": "running" if _classifier is not None else "starting",
-        "source": _active_source_type,
-        "fps_target": FRAME_FPS,
-        "max_ingest_fps": MAX_INGEST_FPS,
+        "mode": "batch-analysis",
         "violence_threshold": _classifier.threshold if _classifier else None,
+        "pose_model": str(_classifier.pose_model_path) if _classifier else None,
+        "stgcn_model": str(_classifier.model_path) if _classifier else None,
+        "lstm_model": str(_classifier.model_path) if _classifier else None,
+        "ort_threads": _classifier.intra_op_threads if _classifier else None,
         "alert_hold_frames": ALERT_HOLD_FRAMES,
         "consecutive_triggers_required": CONSECUTIVE_TRIGGERS_REQUIRED,
-        "pose_stride": _classifier.pose_stride if _classifier else None,
-        "ort_threads": _classifier.intra_op_threads if _classifier else None,
-        "ingestion_alive": bool(_producer_task and not _producer_task.done()),
-        "model": str(_classifier.model_path) if _classifier else None,
-        "pose_model": str(_classifier.pose_model_path) if _classifier else None,
-        "websocket_clients": len(_ws_clients),
     }
 
 
-@app.post("/api/source/webcam")
-@app.post("/source/webcam")
-async def use_webcam() -> dict:
+@app.get("/api/samples")
+async def list_samples() -> dict[str, Any]:
+    """Return available sample clips for quick testing."""
+    samples = [
+        {
+            "id": "NV_1.mp4",
+            "name": "Normal Activity (NV_1)",
+            "category": "Safe",
+            "description": "Standard multi-person movement and benign interaction.",
+        },
+        {
+            "id": "V_1.mp4",
+            "name": "Physical Altercation (V_1)",
+            "category": "Violence",
+            "description": "Rapid strike kinematic acceleration and interaction turbulence.",
+        },
+        {
+            "id": "safe_sample.mp4",
+            "name": "Embedded Safe Benchmark",
+            "category": "Safe",
+            "description": "Everyday physical activity benchmark.",
+        },
+        {
+            "id": "violence_sample.mp4",
+            "name": "Embedded Violence Incident",
+            "category": "Violence",
+            "description": "Verified aggressive engagement clip.",
+        },
+    ]
+    return {"samples": samples}
+
+
+class AnalyzeRequest(BaseModel):
+    sample_name: Optional[str] = None
+
+
+@app.post("/api/analyze_video")
+async def analyze_video_endpoint(
+    file: Optional[UploadFile] = File(None),
+    sample_name: Optional[str] = Form(None),
+    sample_query: Optional[str] = Query(None, alias="sample"),
+) -> dict[str, Any]:
+    """Process an entire video clip sequentially using Pose + LSTM kinematics.
+
+    Accepts an uploaded .mp4 file or a sample name from data/raw or frontend/public/samples.
+    Returns:
+    {
+        "overall_verdict": "Violence" | "Safe",
+        "confidence": 0.89,
+        "incident_timestamps": [1.4, 1.6, ...],
+        "processing_time_sec": 4.2,
+        "frame_count": 103,
+        "video_duration_sec": 3.43,
+        "video_fps": 30.0,
+        "peak_probability": 0.89,
+        "timeline": [...]
+    }
+    """
     if _classifier is None:
-        raise HTTPException(status_code=503, detail="Inference model is not loaded.")
-    await _use_browser_webcam()
-    return {"status": "ok", "source": "webcam"}
+        raise HTTPException(status_code=503, detail="Inference model is not loaded yet.")
 
+    target_video_path: Optional[Path] = None
+    is_temporary_file = False
 
-@app.post("/source/rtsp")
-async def use_rtsp(request: RTSPSourceRequest) -> dict:
-    if _classifier is None:
-        raise HTTPException(status_code=503, detail="Inference model is not loaded.")
-    parsed = urlsplit(request.source)
-    if parsed.scheme.lower() not in {"rtsp", "rtsps"} or not parsed.netloc:
-        raise HTTPException(status_code=400, detail="Provide a valid rtsp:// or rtsps:// URL.")
-    try:
-        await _swap_source(request.source, loop_file=True)
-    except (OSError, ValueError) as exc:
-        log.warning("Could not open RTSP input (%s).", type(exc).__name__)
-        raise HTTPException(status_code=400, detail="Could not open RTSP source.") from exc
-    return {"status": "ok", "source": "rtsp"}
+    chosen_sample = sample_name or sample_query
 
+    if file is not None and file.filename:
+        suffix = Path(file.filename).suffix.lower()
+        if suffix not in {".mp4", ".avi", ".mov", ".mkv"}:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported format '{suffix}'. Please upload an MP4 video.",
+            )
 
-@app.post("/upload")
-async def upload_video(file: UploadFile = File(...)) -> dict:
-    if _classifier is None:
-        raise HTTPException(status_code=503, detail="Inference model is not loaded.")
-    if Path(file.filename or "").suffix.lower() != ".mp4":
-        raise HTTPException(status_code=400, detail="Only .mp4 videos are supported.")
-
-    directory = Path(tempfile.gettempdir()) / "violence-detection-uploads"
-    temporary_path: Optional[Path] = None
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="wb", suffix=".mp4", prefix="upload-", dir=directory, delete=False
-        ) as destination:
-            temporary_path = Path(destination.name)
+        temp_dir = Path(tempfile.gettempdir()) / "edge-video-batch"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_dest = tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".mp4", prefix="batch_upload_", dir=temp_dir, delete=False
+        )
+        temp_path = Path(temp_dest.name)
+        try:
             total_bytes = 0
             while chunk := await file.read(1024 * 1024):
                 total_bytes += len(chunk)
                 if total_bytes > MAX_UPLOAD_BYTES:
                     raise HTTPException(
                         status_code=413,
-                        detail=f"Upload exceeds {MAX_UPLOAD_BYTES} bytes.",
+                        detail=f"Uploaded file exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit.",
                     )
-                destination.write(chunk)
-        if total_bytes == 0:
-            raise HTTPException(status_code=400, detail="Uploaded video is empty.")
-        await _swap_source(
-            str(temporary_path), loop_file=False, upload_path=temporary_path
+                temp_dest.write(chunk)
+            temp_dest.flush()
+            temp_dest.close()
+
+            if total_bytes == 0:
+                raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+            target_video_path = temp_path
+            is_temporary_file = True
+        except Exception:
+            temp_dest.close()
+            temp_path.unlink(missing_ok=True)
+            raise
+        finally:
+            await file.close()
+
+    elif chosen_sample:
+        try:
+            target_video_path = resolve_sample_video(chosen_sample)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Either a video file upload or a sample_name must be provided.",
         )
-        temporary_path = None
-        return {"status": "ok", "source": "upload"}
-    except HTTPException:
-        raise
-    except (OSError, ValueError) as exc:
-        log.exception("Could not start uploaded MP4.")
-        raise HTTPException(status_code=400, detail="Could not open uploaded video.") from exc
+
+    try:
+        log.info("Starting sequential batch analysis for: %s", target_video_path)
+        # Run inference in a thread pool to avoid blocking the asyncio event loop
+        async with _analysis_lock:
+            report = await asyncio.to_thread(_classifier.analyze_video, target_video_path)
+
+        log.info(
+            "Batch analysis finished for %s: verdict=%s, confidence=%.2f, time=%.2fs",
+            target_video_path.name,
+            report["overall_verdict"],
+            report["confidence"],
+            report["processing_time_sec"],
+        )
+
+        # Log incident if violence detected
+        if report["overall_verdict"] == "Violence" and _incident_logger is not None:
+            await asyncio.to_thread(
+                _incident_logger.log_batch_incident,
+                video_source=target_video_path.name,
+                probability=report["confidence"],
+                incident_timestamps=report["incident_timestamps"],
+                details=f"Batch analysis identified incidents at timestamps: {report['incident_timestamps'][:5]}",
+            )
+
+        return report
+
+    except Exception as exc:
+        log.exception("Error processing video %s: %s", target_video_path, exc)
+        raise HTTPException(
+            status_code=500, detail=f"Analysis pipeline error: {str(exc)}"
+        )
     finally:
-        await file.close()
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+        if is_temporary_file and target_video_path is not None:
+            target_video_path.unlink(missing_ok=True)
 
 
 @app.get("/api/incidents")
 async def get_incidents(
     limit: int = Query(default=50, ge=1, le=500),
     since: Optional[float] = Query(default=None),
-) -> dict:
+) -> dict[str, Any]:
     if _incident_logger is None:
         raise HTTPException(status_code=503, detail="Logger is not initialized.")
     records = await asyncio.to_thread(
@@ -649,46 +302,13 @@ async def get_incidents(
 
 
 @app.get("/api/stats")
-async def get_stats(hours: float = Query(default=24.0, ge=0.1, le=720)) -> dict:
+async def get_stats(hours: float = Query(default=24.0, ge=0.1, le=720)) -> dict[str, Any]:
     if _incident_logger is None:
         raise HTTPException(status_code=503, detail="Logger is not initialized.")
     return await asyncio.to_thread(_incident_logger.get_incident_count, hours)
 
 
-@app.websocket("/ws/stream")
-async def websocket_stream(websocket: WebSocket) -> None:
-    await websocket.accept()
-    frame_queue: asyncio.Queue[tuple[np.ndarray, int]] = asyncio.Queue(maxsize=1)
-    _ws_send_locks[websocket] = asyncio.Lock()
-    async with _ws_lock:
-        _ws_clients.add(websocket)
-    reader_task = asyncio.create_task(
-        _receive_websocket_messages(websocket, frame_queue),
-        name="websocket-frame-reader",
-    )
-    processor_task = asyncio.create_task(
-        _process_websocket_frames(websocket, frame_queue),
-        name="websocket-frame-inference",
-    )
-    try:
-        done, _ = await asyncio.wait(
-            {reader_task, processor_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in done:
-            task.result()
-    except WebSocketDisconnect:
-        pass
-    finally:
-        for task in (reader_task, processor_task):
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(reader_task, processor_task, return_exceptions=True)
-        async with _ws_lock:
-            _ws_clients.discard(websocket)
-        _ws_send_locks.pop(websocket, None)
-
-
+# Serve built Next.js export if present
 frontend_dir = next(
     (
         path
@@ -705,8 +325,12 @@ if frontend_dir is not None:
 else:
 
     @app.get("/")
-    async def root() -> dict:
-        return {"service": "Spatio-Temporal Violence Detection", "status": "running"}
+    async def root() -> dict[str, Any]:
+        return {
+            "service": "AI Video Kinematics & Incident Analysis Service",
+            "status": "running",
+            "docs": "/docs",
+        }
 
 
 if __name__ == "__main__":
@@ -715,8 +339,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=int(os.getenv("PORT", "7860")),
+        port=int(os.getenv("PORT", "8000")),
         log_level=LOG_LEVEL.lower(),
-        ws_ping_interval=30,
-        ws_ping_timeout=10,
     )

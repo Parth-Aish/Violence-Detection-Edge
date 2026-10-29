@@ -15,16 +15,13 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Violence Detection System — Edge AI Surveillance",
+  title: "Edge Vision — Enterprise Video Kinematics & AI Violence Detection",
   description:
-    "Real-time edge-deployed violence detection using YOLOv8-Pose and spatio-temporal velocity heuristics for legacy surveillance infrastructure.",
+    "Enterprise video kinematics and violence detection platform supporting asynchronous cloud batch analysis and high-throughput real-time edge execution.",
   keywords: [
-    "violence detection",
-    "edge AI",
-    "YOLOv8",
-    "pose estimation",
-    "surveillance",
-    "real-time",
+    "violence detection", "edge AI", "video analysis", "ONNX Runtime",
+    "YOLOv8-Pose", "LSTM", "biomechanical analysis", "kinematics",
+    "batch processing", "real-time inference", "privacy-first",
   ],
 };
 

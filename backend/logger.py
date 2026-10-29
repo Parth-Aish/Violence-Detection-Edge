@@ -134,6 +134,28 @@ class IncidentLogger:
             )
             return record
 
+    def log_batch_incident(
+        self,
+        video_source: str,
+        probability: float,
+        incident_timestamps: Optional[list[float]] = None,
+        details: str = "",
+    ) -> Optional[dict]:
+        """Record an incident identified during batch video analysis."""
+        from inference import Severity, ViolencePrediction
+        sev = Severity.HIGH if probability >= 0.8 else Severity.MEDIUM
+        pred = ViolencePrediction(
+            is_fighting=True,
+            probability=probability,
+            severity=sev,
+            confidence=probability,
+            bbox=None,
+            timestamp=time.time(),
+            inference_ms=0.0,
+            fps=30.0,
+        )
+        return self.log_prediction(pred)
+
     def get_recent_incidents(
         self, limit: int = 50, since_timestamp: Optional[float] = None
     ) -> list[dict]:

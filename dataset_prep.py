@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import re
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -14,6 +15,13 @@ from typing import Optional
 import cv2
 import numpy as np
 from ultralytics import YOLO
+
+# Add root to sys.path to allow imports from backend.core
+_root_dir = str(Path(__file__).resolve().parent)
+if _root_dir not in sys.path:
+    sys.path.insert(0, _root_dir)
+
+from backend.core.transforms import raw_to_stgcn_tensor
 
 
 LOGGER = logging.getLogger("dataset_prep")
@@ -186,22 +194,42 @@ def prepare_dataset(
     targets = np.asarray([label for _, label in ordered], dtype=np.float32)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for filename, array in (("X_train.npy", features), ("y_train.npy", targets)):
+    stgcn_features = raw_to_stgcn_tensor(features)
+    for filename, array in (
+        ("X_train.npy", features),
+        ("X_train_stgcn.npy", stgcn_features),
+        ("y_train.npy", targets),
+    ):
         temporary = output_dir / f".{filename}.tmp"
         with temporary.open("wb") as stream:
             np.save(stream, array, allow_pickle=False)
         os.replace(temporary, output_dir / filename)
 
     LOGGER.info(
-        "Saved %d sequences (%d violence, %d non-violence), skipped %d; X=%s, y=%s",
+        "Saved %d sequences (%d violence, %d non-violence), skipped %d; X_raw=%s, X_stgcn=%s, y=%s",
         len(targets),
         int(np.sum(targets == 1)),
         int(np.sum(targets == 0)),
         len(failures),
         features.shape,
+        stgcn_features.shape,
         targets.shape,
     )
     return features, targets
+
+
+def convert_existing_to_stgcn(processed_dir: Path) -> Path:
+    """Convert an existing X_train.npy into X_train_stgcn.npy."""
+    raw_path = processed_dir / "X_train.npy"
+    if not raw_path.is_file():
+        raise FileNotFoundError(f"Missing {raw_path}")
+    raw_features = np.load(raw_path)
+    LOGGER.info("Loading existing %s with shape %s", raw_path, raw_features.shape)
+    stgcn_features = raw_to_stgcn_tensor(raw_features)
+    stgcn_path = processed_dir / "X_train_stgcn.npy"
+    np.save(stgcn_path, stgcn_features)
+    LOGGER.info("Saved ST-GCN tensor to %s with shape %s", stgcn_path, stgcn_features.shape)
+    return stgcn_path
 
 
 def main() -> int:
@@ -210,11 +238,17 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--model", default="yolov8n-pose.pt")
     parser.add_argument("--workers", type=int, default=min(2, os.cpu_count() or 1))
+    parser.add_argument("--convert-only", action="store_true", help="Convert existing X_train.npy to ST-GCN tensor")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.convert_only:
+        convert_existing_to_stgcn(args.output_dir.resolve())
+        return 0
 
     if args.workers < 1:
         parser.error("--workers must be at least 1")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         prepare_dataset(
             args.dataset_dir.resolve(),

@@ -1,4 +1,4 @@
-"""Train and export the pose-sequence violence LSTM."""
+"""Train and export the physics-aware biomechanical violence detection model."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import math
 import os
 import random
+import shutil
 import sys
 from pathlib import Path
 
@@ -16,37 +17,72 @@ from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-
 ROOT = Path(__file__).resolve().parent
 SEQUENCE_LENGTH = 30
-FEATURES = 34
-OPERATIONAL_THRESHOLD = 0.58
-sys.path.insert(0, str(ROOT / "backend"))
-from pose_features import normalize_pose_batch
+FEATURES = 82
+OPERATIONAL_THRESHOLD = 0.65
 
 
-class ViolenceLSTM(nn.Module):
-    """Small binary classifier for a 30-frame, 34-coordinate pose sequence."""
+class TemporalAttention(nn.Module):
+    """Temporal attention pooling: focuses on the exact 3-5 frames of impact/grappling."""
 
-    def __init__(self) -> None:
+    def __init__(self, feature_dim: int, hidden_dim: int = 32) -> None:
         super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=FEATURES,
-            hidden_size=64,
+        self.attn = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, D]
+        scores = self.attn(x)  # [B, T, 1]
+        weights = torch.softmax(scores, dim=1)
+        context = torch.sum(x * weights, dim=1)  # [B, D]
+        return context
+
+
+class BiomechanicalViolenceModel(nn.Module):
+    """Input LayerNorm -> Bidirectional GRU/LSTM -> Temporal Attention Pooling -> Classifier."""
+
+    def __init__(
+        self,
+        input_dim: int = FEATURES,
+        hidden_dim: int = 64,
+        dropout: float = 0.25,
+    ) -> None:
+        super().__init__()
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.rnn = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
             num_layers=1,
             batch_first=True,
+            bidirectional=True,
         )
-        self.classifier = nn.Linear(64, 1)
+        rnn_out_dim = hidden_dim * 2  # 128
+        self.attention = TemporalAttention(feature_dim=rnn_out_dim, hidden_dim=32)
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(rnn_out_dim, 32),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 1),
+        )
 
     def forward(self, sequence: torch.Tensor) -> torch.Tensor:
-        output, _ = self.lstm(sequence)
-        return self.classifier(output[:, -1, :]).squeeze(-1)
+        # sequence: [B, 30, 82]
+        normed = self.input_norm(sequence)
+        rnn_out, _ = self.rnn(normed)
+        context = self.attention(rnn_out)
+        logits = self.classifier(context).squeeze(-1)
+        return logits
 
 
 class ProbabilityOutput(nn.Module):
-    """Export adapter exposing a fighting probability rather than logits."""
+    """Export adapter exposing fighting probability rather than logits."""
 
-    def __init__(self, model: ViolenceLSTM) -> None:
+    def __init__(self, model: BiomechanicalViolenceModel) -> None:
         super().__init__()
         self.model = model
 
@@ -62,36 +98,7 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def augment_temporal_windows(
-    sequences: np.ndarray, rng: np.random.Generator
-) -> np.ndarray:
-    """Resample random 10–20 frame windows to train on reduced input rates."""
-    augmented = np.empty_like(sequences, dtype=np.float32)
-    for index, sequence in enumerate(sequences):
-        valid_frames = np.flatnonzero(np.any(sequence != 0.0, axis=1))
-        if valid_frames.size == 0:
-            augmented[index] = sequence
-            continue
-        first = int(valid_frames[0])
-        last = int(valid_frames[-1]) + 1
-        available = last - first
-        window_length = min(available, int(rng.integers(10, 21)))
-        start = int(rng.integers(first, last - window_length + 1))
-        window = sequence[start : start + window_length]
-        source_positions = np.arange(window_length, dtype=np.float32)
-        target_positions = np.linspace(
-            0.0, max(window_length - 1, 0), num=SEQUENCE_LENGTH, dtype=np.float32
-        )
-        for feature_index in range(FEATURES):
-            augmented[index, :, feature_index] = np.interp(
-                target_positions,
-                source_positions,
-                window[:, feature_index],
-            )
-    return augmented
-
-
-def export_onnx(model: ViolenceLSTM, destination: Path) -> None:
+def export_onnx(model: BiomechanicalViolenceModel, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.stem}.tmp.onnx")
     adapter = ProbabilityOutput(model).eval()
@@ -116,66 +123,52 @@ def export_onnx(model: ViolenceLSTM, destination: Path) -> None:
 
 def train(args: argparse.Namespace) -> dict[str, float]:
     seed_everything(args.seed)
+    print(f"Loading kinematic features from: {args.features}")
     x = np.load(args.features, allow_pickle=False).astype(np.float32, copy=False)
-    y = np.load(args.labels, allow_pickle=False).astype(np.int64, copy=False).reshape(-1)
+    y = np.load(args.labels, allow_pickle=False).astype(np.float32, copy=False).reshape(-1)
 
     if x.ndim != 3 or x.shape[1:] != (SEQUENCE_LENGTH, FEATURES):
         raise ValueError(
             f"Expected X shape (N, {SEQUENCE_LENGTH}, {FEATURES}), got {x.shape}."
         )
-    if y.shape[0] != x.shape[0] or not np.isin(y, [0, 1]).all():
+    if y.shape[0] != x.shape[0] or not np.isin(y, [0.0, 1.0]).all():
         raise ValueError("Labels must have one binary 0/1 value per input sequence.")
-    class_counts = np.bincount(y, minlength=2)
-    if np.any(class_counts < 2):
-        raise ValueError(
-            "At least two samples from each class are required for a stratified split."
-        )
     if not np.isfinite(x).all():
         raise ValueError("Feature array contains NaN or infinite values.")
-    x = normalize_pose_batch(x)
 
     indices = np.arange(len(y))
     test_count = max(2, math.ceil(len(y) * 0.2))
-    if test_count >= len(y):
-        raise ValueError("Not enough sequences for an 80/20 train/test split.")
     train_indices, test_indices = train_test_split(
         indices,
         test_size=test_count,
         random_state=args.seed,
-        stratify=y,
+        stratify=y.astype(int),
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    x_tensor = torch.from_numpy(x)
-    y_tensor = torch.from_numpy(y.astype(np.float32, copy=False))
-    model = ViolenceLSTM().to(device)
-    positive_count = int(np.sum(y[train_indices] == 1))
-    negative_count = int(np.sum(y[train_indices] == 0))
-    loss_fn = nn.BCEWithLogitsLoss(
-        pos_weight=torch.tensor(negative_count / positive_count, device=device)
-    )
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    print(f"Training on device: {device}")
 
-    augmentation_rng = np.random.default_rng(args.seed)
+    model = BiomechanicalViolenceModel().to(device)
+    loss_fn = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    # Label smoothing to prevent overconfident false positives
+    label_smoothing = 0.05
+    y_train_raw = y[train_indices]
+    y_train_smooth = y_train_raw * (1.0 - 2.0 * label_smoothing) + label_smoothing
+
+    train_dataset = TensorDataset(
+        torch.from_numpy(x[train_indices]),
+        torch.from_numpy(y_train_smooth.astype(np.float32)),
+    )
+
     for epoch in range(args.epochs):
-        epoch_sequences = np.concatenate(
-            (
-                x[train_indices],
-                augment_temporal_windows(x[train_indices], augmentation_rng),
-            ),
-            axis=0,
-        )
-        epoch_labels = np.concatenate((y[train_indices], y[train_indices]))
-        epoch_dataset = TensorDataset(
-            torch.from_numpy(epoch_sequences),
-            torch.from_numpy(epoch_labels.astype(np.float32, copy=False)),
-        )
-        generator = torch.Generator().manual_seed(args.seed + epoch)
         loader = DataLoader(
-            epoch_dataset,
+            train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            generator=generator,
+            generator=torch.Generator().manual_seed(args.seed + epoch),
         )
         model.train()
         total_loss = 0.0
@@ -184,61 +177,77 @@ def train(args: argparse.Namespace) -> dict[str, float]:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
             optimizer.zero_grad(set_to_none=True)
-            loss = loss_fn(model(batch_x), batch_y)
+            logits = model(batch_x)
+            loss = loss_fn(logits, batch_y)
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * len(batch_y)
             examples += len(batch_y)
-        print(f"epoch {epoch + 1:03d}/{args.epochs}: loss={total_loss / examples:.5f}")
+        scheduler.step()
+        if (epoch + 1) % 5 == 0 or epoch == args.epochs - 1:
+            print(f"epoch {epoch + 1:03d}/{args.epochs}: loss={total_loss / examples:.5f}")
 
+    # Evaluation on test set
     model.eval()
+    x_test_tensor = torch.from_numpy(x[test_indices]).to(device)
     with torch.no_grad():
-        logits = model(x_tensor[test_indices].to(device))
+        logits = model(x_test_tensor)
         probabilities = torch.sigmoid(logits).cpu().numpy()
-    predictions = (probabilities > OPERATIONAL_THRESHOLD).astype(np.int64)
-    y_test = y[test_indices]
+
+    y_test = y[test_indices].astype(int)
+    predictions_operational = (probabilities >= OPERATIONAL_THRESHOLD).astype(int)
+    predictions_50 = (probabilities >= 0.50).astype(int)
+
     metrics = {
-        "precision": float(precision_score(y_test, predictions, zero_division=0)),
-        "recall": float(recall_score(y_test, predictions, zero_division=0)),
-        "f1": float(f1_score(y_test, predictions, zero_division=0)),
+        "precision": float(precision_score(y_test, predictions_operational, zero_division=0)),
+        "recall": float(recall_score(y_test, predictions_operational, zero_division=0)),
+        "f1": float(f1_score(y_test, predictions_operational, zero_division=0)),
         "test_sequences": float(len(test_indices)),
         "operating_threshold": OPERATIONAL_THRESHOLD,
     }
+    print(f"\n--- Validation Metrics (Threshold = {OPERATIONAL_THRESHOLD:.2f}) ---")
     for name, value in metrics.items():
         print(f"test_{name}: {value:.4f}" if name != "test_sequences" else f"{name}: {int(value)}")
-    baseline_predictions = (probabilities >= 0.5).astype(np.int64)
-    print(
-        "test_precision_at_0.50: "
-        f"{precision_score(y_test, baseline_predictions, zero_division=0):.4f}"
-    )
-    print(
-        "test_recall_at_0.50: "
-        f"{recall_score(y_test, baseline_predictions, zero_division=0):.4f}"
-    )
-    print(
-        "test_f1_at_0.50: "
-        f"{f1_score(y_test, baseline_predictions, zero_division=0):.4f}"
-    )
+    print(f"test_f1_at_0.50: {f1_score(y_test, predictions_50, zero_division=0):.4f}")
 
-    export_onnx(model.cpu(), args.onnx_out)
-    print(f"Exported ONNX model: {args.onnx_out}")
-    print(f"ONNX decision threshold used by backend: > {OPERATIONAL_THRESHOLD:.2f}")
+    # Export to backend/violence_lstm_v2.onnx
+    destination = Path(args.onnx_out)
+    export_onnx(model.cpu(), destination)
+    print(f"Successfully exported ONNX model to: {destination}")
+
+    # Copy to frontend public models directory
+    frontend_models_dir = ROOT / "frontend" / "public" / "models"
+    if frontend_models_dir.exists():
+        fe_dest = frontend_models_dir / destination.name
+        shutil.copy2(destination, fe_dest)
+        print(f"Synced model to frontend: {fe_dest}")
+
     return metrics
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--features", type=Path, default=ROOT / "data" / "processed" / "X_train.npy")
-    parser.add_argument("--labels", type=Path, default=ROOT / "data" / "processed" / "y_train.npy")
-    parser.add_argument("--onnx-out", type=Path, default=ROOT / "backend" / "violence_lstm.onnx")
+    parser.add_argument(
+        "--features",
+        type=Path,
+        default=ROOT / "data" / "processed" / "X_train_kinematic.npy",
+    )
+    parser.add_argument(
+        "--labels",
+        type=Path,
+        default=ROOT / "data" / "processed" / "y_train.npy",
+    )
+    parser.add_argument(
+        "--onnx-out",
+        type=Path,
+        default=ROOT / "backend" / "violence_lstm_v2.onnx",
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true", help="Force training on CPU.")
     args = parser.parse_args()
-    if args.epochs < 1 or args.batch_size < 1:
-        parser.error("--epochs and --batch-size must be positive")
 
     try:
         train(args)
