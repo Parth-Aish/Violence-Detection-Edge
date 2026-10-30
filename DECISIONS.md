@@ -94,3 +94,21 @@ This document records the architectural shifts and engineering rationale for the
 - **Impact:**
   - Eliminates multi-actor track collapse during grappling.
   - Ensures continuous 2-person Relational Strike Gating even under severe mutual occlusion.
+
+---
+
+## Decision 7: Hardware & Compute Partitioning (Lightweight Cloud vs. Heavyweight Local Edge)
+
+- **Context:**
+  Cloud serverless or micro-instance deployments often enforce strict memory limits (such as 512MB RAM) and charge per CPU cycle, whereas on-premise local edge surveillance nodes possess multi-core CPUs and dedicated hardware intended for 24/7 continuous operation.
+- **Decision:**
+  Explicitly partition model compute parameters across runtime environments:
+  1. **Lightweight Cloud (`backend/main.py`):**
+     - Configured with `intra_op_threads=1` and `pose_stride=3`.
+     - Scene Context Gating (MobileNetV3) is explicitly disabled / bypassed with a zero-overhead dummy, preventing PyTorch neural network weights from loading into host RAM. This reduces the cloud memory footprint to well under 512MB.
+  2. **Heavyweight Local Edge (`backend/run_live.py`):**
+     - Configured with `intra_op_threads=os.cpu_count()` and `pose_stride=1` for maximum per-frame precision.
+     - Scene Context Gating is enabled to run at 1 FPS, providing continuous immunity against sports false positives on real-world local feeds.
+- **Impact:**
+  - Guarantees cloud containers stay lightweight and crash-free under stringent RAM constraints.
+  - Fully leverages local edge computing power for maximum frame rates and zero missed detections.

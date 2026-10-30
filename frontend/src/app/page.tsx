@@ -1,6 +1,30 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import {
+  UploadCloud,
+  Film,
+  ShieldCheck,
+  AlertTriangle,
+  Activity,
+  Clock,
+  Cpu,
+  Layers,
+  Play,
+  Check,
+  Copy,
+  Terminal,
+  Sparkles,
+  RefreshCw,
+  FileVideo,
+  Radar,
+  Flame,
+  CheckCircle2,
+  ChevronRight,
+  Shield,
+  Zap,
+} from "lucide-react";
 
 // ─── API Config ─────────────────────────────────────────────────────────────
 const API_URL =
@@ -16,8 +40,11 @@ interface TimelinePoint {
   timestamp: number;
   probability: number;
   is_fighting: boolean;
-  person_count: number;
-  bio_score: number;
+  person_count?: number;
+  bio_score?: number;
+  min_strike_dist?: number;
+  max_iou?: number;
+  gate_triggered?: boolean;
 }
 
 interface AnalysisReport {
@@ -29,35 +56,50 @@ interface AnalysisReport {
   video_duration_sec?: number;
   video_fps?: number;
   peak_probability?: number;
+  is_sports_context?: boolean;
   timeline?: TimelinePoint[];
 }
 
 interface SampleItem {
   id: string;
   name: string;
+  label: string;
   category: "Safe" | "Violence";
   description: string;
   videoUrl: string;
+  badgeColor: string;
 }
 
 const PRESET_SAMPLES: SampleItem[] = [
   {
     id: "NV_1.mp4",
-    name: "Safe Activity (NV_1)",
+    name: "Normal Activity (NV_1)",
+    label: "Safe Scenario",
     category: "Safe",
-    description: "Multi-person physical motion without hostile kinetic acceleration.",
+    description: "Multi-person physical gestures and normal walking without hostile convergence.",
     videoUrl: "/samples/safe_sample.mp4",
+    badgeColor: "emerald",
   },
   {
     id: "V_1.mp4",
     name: "Physical Altercation (V_1)",
+    label: "Violence Scenario",
     category: "Violence",
-    description: "Rapid strike velocity bursts, close proximity, and interaction turbulence.",
+    description: "Rapid strike acceleration, close inter-actor proximity, and violent kinematics.",
     videoUrl: "/samples/violence_sample.mp4",
+    badgeColor: "rose",
   },
 ];
 
-export default function VideoAnalysisDashboard() {
+const SCAN_STEPS = [
+  "Extracting Skeletal Kinematics (YOLOv8-Pose)...",
+  "Tracking Multi-Actor Occlusions (Kalman Momentum)...",
+  "Computing Spatial-Temporal Graphs (ST-GCN Topology)...",
+  "Evaluating Cross-Person Relational Strike Gate...",
+  "Synthesizing Biomechanical Telemetry...",
+];
+
+export default function AppleGradeVisionDashboard() {
   const [selectedSample, setSelectedSample] = useState<SampleItem | null>(PRESET_SAMPLES[0]);
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [previewVideoUrl, setPreviewVideoUrl] = useState<string>(PRESET_SAMPLES[0].videoUrl);
@@ -66,6 +108,8 @@ export default function VideoAnalysisDashboard() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [apiConnected, setApiConnected] = useState<boolean | null>(null);
   const [copiedSnippet, setCopiedSnippet] = useState<boolean>(false);
+  const [isDragOver, setIsDragOver] = useState<boolean>(false);
+  const [scanStepIndex, setScanStepIndex] = useState<number>(0);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -85,7 +129,19 @@ export default function VideoAnalysisDashboard() {
     return () => clearInterval(interval);
   }, []);
 
-  // Update preview URL when sample changes
+  // Active Waiting sequence cycling
+  useEffect(() => {
+    if (!isAnalyzing) {
+      setScanStepIndex(0);
+      return;
+    }
+    const timer = setInterval(() => {
+      setScanStepIndex((prev) => (prev + 1) % SCAN_STEPS.length);
+    }, 1200);
+    return () => clearInterval(timer);
+  }, [isAnalyzing]);
+
+  // Handle sample selection
   const handleSelectSample = (sample: SampleItem) => {
     setSelectedSample(sample);
     setUploadedFile(null);
@@ -119,9 +175,20 @@ export default function VideoAnalysisDashboard() {
     }
   };
 
-  // Drag and drop handler
+  // Drag and drop handlers
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragOver(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragOver(false);
+  };
+
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
+    setIsDragOver(false);
     const file = e.dataTransfer.files?.[0];
     if (!file) return;
     if (!file.name.toLowerCase().endsWith(".mp4")) {
@@ -135,6 +202,9 @@ export default function VideoAnalysisDashboard() {
 
     const objectUrl = URL.createObjectURL(file);
     setPreviewVideoUrl(objectUrl);
+    if (videoRef.current) {
+      videoRef.current.currentTime = 0;
+    }
   };
 
   // Run batch video analysis
@@ -166,7 +236,7 @@ export default function VideoAnalysisDashboard() {
       const report: AnalysisReport = await res.json();
       setAnalysisReport(report);
 
-      // If incidents found, jump video to first incident
+      // Jump video to first incident
       if (report.incident_timestamps && report.incident_timestamps.length > 0 && videoRef.current) {
         videoRef.current.currentTime = Math.max(0, report.incident_timestamps[0] - 0.5);
       }
@@ -188,7 +258,7 @@ export default function VideoAnalysisDashboard() {
   const edgeSnippet = `git clone https://github.com/Parth-Aish/Violence-Detection-Edge.git
 cd Violence-Detection-Edge
 pip install -r requirements.txt
-python run_live.py`;
+python run_live.py --source 0`;
 
   const copySnippet = () => {
     navigator.clipboard.writeText(edgeSnippet);
@@ -197,45 +267,52 @@ python run_live.py`;
   };
 
   return (
-    <div className="min-h-screen bg-[#09090b] text-[#fafafa] flex flex-col font-sans selection:bg-indigo-500/30 selection:text-white">
-      {/* ── Header ────────────────────────────────────────────────────────── */}
-      <header className="sticky top-0 z-50 border-b border-white/10 bg-[#09090b]/80 backdrop-blur-xl px-6 py-3.5">
+    <div className="min-h-screen bg-[#070709] text-zinc-100 flex flex-col font-sans selection:bg-rose-500/30 selection:text-white relative overflow-x-hidden">
+      {/* ── Ambient Apple-Grade Background Glows ─────────────────────────────── */}
+      <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden">
+        <div className="absolute top-[-15%] left-[20%] w-[650px] h-[650px] bg-gradient-to-br from-indigo-600/15 via-purple-600/10 to-transparent rounded-full blur-[140px] transform-gpu" />
+        <div className="absolute bottom-[-10%] right-[10%] w-[550px] h-[550px] bg-gradient-to-tl from-cyan-600/10 via-emerald-600/5 to-transparent rounded-full blur-[130px] transform-gpu" />
+        <div className="absolute inset-0 bg-[radial-gradient(ellipse_80%_80%_at_50%_-20%,rgba(120,119,198,0.08),rgba(255,255,255,0))]" />
+      </div>
+
+      {/* ── Header: Apple Frosted Glass Bar ───────────────────────────────── */}
+      <header className="sticky top-0 z-50 border-b border-white/[0.08] bg-[#070709]/70 backdrop-blur-2xl px-6 py-3.5 transition-all">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="h-9 w-9 rounded-xl bg-gradient-to-tr from-indigo-500 via-purple-500 to-pink-500 flex items-center justify-center shadow-lg shadow-indigo-500/25">
-              <span className="text-white font-black text-lg">V</span>
+          <div className="flex items-center gap-3.5">
+            <div className="h-10 w-10 rounded-2xl bg-gradient-to-tr from-white/[0.12] to-white/[0.04] border border-white/20 flex items-center justify-center shadow-lg shadow-black/40 backdrop-blur-xl">
+              <Activity className="h-5 w-5 text-zinc-100" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-base font-bold tracking-tight text-white">
+              <div className="flex items-center gap-2.5">
+                <h1 className="text-sm font-semibold tracking-tight text-white">
                   Vision Kinematics
                 </h1>
-                <span className="text-[10px] font-semibold tracking-wider uppercase px-2 py-0.5 rounded-full bg-white/[0.08] text-zinc-300 border border-white/10">
-                  Batch Analytics
+                <span className="text-[10px] font-medium tracking-wide uppercase px-2 py-0.5 rounded-full bg-white/[0.06] text-zinc-300 border border-white/10">
+                  ST-GCN • Edge & Cloud
                 </span>
               </div>
-              <p className="text-xs text-zinc-400">
-                Spatio-Temporal Pose Kinematics & Kinetic Incident Detection
+              <p className="text-[11px] text-zinc-400 font-normal">
+                Spatial-Temporal Graph Convolutions & Relational Strike Gating
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2 rounded-full border border-white/10 bg-black/40 px-3 py-1 text-xs">
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3.5 py-1.5 text-xs backdrop-blur-xl shadow-inner">
               <span
-                className={`h-2 w-2 rounded-full ${
+                className={`h-2 w-2 rounded-full transition-all duration-300 ${
                   apiConnected === true
-                    ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]"
+                    ? "bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.8)]"
                     : apiConnected === false
-                    ? "bg-rose-500"
+                    ? "bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.8)]"
                     : "bg-amber-400 animate-pulse"
                 }`}
               />
-              <span className="text-zinc-300">
+              <span className="text-zinc-300 text-[11px] font-medium">
                 {apiConnected === true
-                  ? "Cloud API Active"
+                  ? "Cloud API Connected"
                   : apiConnected === false
-                  ? "API Offline (Local Edge)"
+                  ? "API Offline (Run Locally)"
                   : "Connecting..."}
               </span>
             </div>
@@ -244,49 +321,53 @@ python run_live.py`;
       </header>
 
       {/* ── Main Dashboard Body ───────────────────────────────────────────── */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-6 space-y-6">
-        {/* ── Prominent Local Edge Instructions Banner ─────────────────────── */}
+      <main className="flex-1 max-w-7xl w-full mx-auto p-6 md:p-8 space-y-7 z-10">
+        {/* ── Heavyweight Edge Notice Glass Pill ───────────────────────────── */}
         <section
           id="edge-hardware-banner"
-          className="relative overflow-hidden rounded-2xl border border-emerald-500/30 bg-gradient-to-r from-emerald-950/40 via-zinc-900/90 to-cyan-950/30 p-5 shadow-xl shadow-emerald-950/20 backdrop-blur-md"
+          className="relative overflow-hidden rounded-3xl border border-white/[0.09] bg-white/[0.03] backdrop-blur-2xl p-6 shadow-[0_8px_32px_0_rgba(0,0,0,0.36)]"
         >
-          <div className="absolute -top-12 -right-12 h-44 w-44 rounded-full bg-emerald-500/10 blur-3xl pointer-events-none" />
-          <div className="relative flex flex-col lg:flex-row lg:items-center justify-between gap-5">
-            <div className="space-y-1.5 max-w-2xl">
-              <div className="inline-flex items-center gap-2 text-xs font-bold tracking-wider uppercase text-emerald-400">
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-ping" />
-                Edge Hardware Real-Time Mode
+          <div className="relative flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+            <div className="space-y-2 max-w-2xl">
+              <div className="inline-flex items-center gap-2 text-[11px] font-semibold tracking-wider uppercase text-emerald-400">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                Heavyweight Local Edge Mode Available
               </div>
               <h2 className="text-lg md:text-xl font-bold tracking-tight text-white">
-                For 30+ FPS Real-Time Live Camera Detection, run this system locally on Edge hardware.
+                50+ FPS Real-Time Live Surveillance Inference
               </h2>
-              <p className="text-xs md:text-sm text-zinc-300 leading-relaxed">
-                Unlock native webcam and RTSP surveillance camera inference with full multi-threaded CPU/GPU acceleration,
-                zero network latency, and persistent local HUD bounding box overlays.
+              <p className="text-xs md:text-sm text-zinc-300/80 leading-relaxed">
+                Connect directly to your local webcam or RTSP security camera. Runs full multi-core CPU/GPU
+                acceleration with zero network latency, persistent OpenCV skeletal HUDs, and MobileNetV3 Scene Gating.
               </p>
             </div>
 
             <div className="flex-shrink-0 w-full lg:w-auto">
-              <div className="rounded-xl border border-white/10 bg-black/70 p-3 shadow-inner">
-                <div className="flex items-center justify-between gap-4 pb-2 mb-2 border-b border-white/10 text-[11px] text-zinc-400">
-                  <span className="font-mono text-emerald-300">Terminal (PowerShell / Bash)</span>
+              <div className="rounded-2xl border border-white/10 bg-black/40 backdrop-blur-xl p-3.5 shadow-inner">
+                <div className="flex items-center justify-between gap-6 pb-2 mb-2 border-b border-white/[0.08] text-[11px]">
+                  <div className="flex items-center gap-1.5 text-zinc-400">
+                    <Terminal className="h-3.5 w-3.5 text-emerald-400" />
+                    <span className="font-mono">Quick Edge Run</span>
+                  </div>
                   <button
                     id="copy-edge-command-btn"
                     onClick={copySnippet}
-                    className="flex items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] font-semibold bg-white/10 hover:bg-white/20 text-white transition"
+                    className="flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[11px] font-medium bg-white/[0.08] hover:bg-white/[0.15] text-white transition active:scale-95"
                   >
                     {copiedSnippet ? (
                       <>
-                        <span className="text-emerald-400">✓</span> Copied
+                        <Check className="h-3 w-3 text-emerald-400" />
+                        <span className="text-emerald-300">Copied</span>
                       </>
                     ) : (
                       <>
-                        <span>📋</span> Copy Snippet
+                        <Copy className="h-3 w-3 text-zinc-300" />
+                        <span>Copy Command</span>
                       </>
                     )}
                   </button>
                 </div>
-                <pre className="font-mono text-xs text-zinc-200 select-all overflow-x-auto whitespace-pre leading-relaxed">
+                <pre className="font-mono text-xs text-zinc-300 select-all overflow-x-auto whitespace-pre leading-relaxed pr-4">
                   <code>{edgeSnippet}</code>
                 </pre>
               </div>
@@ -295,68 +376,41 @@ python run_live.py`;
         </section>
 
         {/* ── Two-Column Interactive Analysis Console ─────────────────────── */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Left Column: Input Selection & Video Preview (7 cols) */}
-          <div className="lg:col-span-7 space-y-5">
-            {/* Quick-Select Sample Clips */}
-            <div className="rounded-2xl border border-white/10 bg-zinc-900/60 p-5 backdrop-blur-md space-y-4">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-7 items-start">
+          {/* Left Column: Input Dropzone & Video Preview (7 cols) */}
+          <div className="lg:col-span-7 space-y-6">
+            {/* Hick's Law Action Hub: Massive Drag & Drop Zone */}
+            <div className="rounded-3xl border border-white/[0.08] bg-white/[0.025] backdrop-blur-2xl p-6 shadow-[0_8px_32px_0_rgba(0,0,0,0.36)] space-y-5">
               <div className="flex items-center justify-between">
-                <h3 className="text-sm font-semibold tracking-wide text-zinc-200 flex items-center gap-2">
-                  <span>📹</span> 1. Select Video Source
-                </h3>
-                <span className="text-xs text-zinc-400">Sample Clips or Custom MP4</span>
+                <div>
+                  <h3 className="text-sm font-semibold tracking-tight text-white flex items-center gap-2">
+                    <Film className="h-4 w-4 text-zinc-300" />
+                    Select or Drop Video
+                  </h3>
+                  <p className="text-xs text-zinc-400 mt-0.5">
+                    Choose from standard benchmark presets or test with your custom MP4
+                  </p>
+                </div>
+                <span className="text-[11px] font-mono text-zinc-500 uppercase tracking-wider">
+                  Input Stream
+                </span>
               </div>
 
-              {/* Sample Clips Buttons */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {PRESET_SAMPLES.map((sample) => {
-                  const isSelected = selectedSample?.id === sample.id && !uploadedFile;
-                  return (
-                    <button
-                      key={sample.id}
-                      id={`sample-btn-${sample.id.replace(/\W/g, "-")}`}
-                      onClick={() => handleSelectSample(sample)}
-                      disabled={isAnalyzing}
-                      className={`relative text-left p-3.5 rounded-xl border transition duration-200 flex flex-col justify-between ${
-                        isSelected
-                          ? sample.category === "Safe"
-                            ? "border-emerald-500/50 bg-emerald-950/20 shadow-[0_0_15px_-3px_rgba(16,185,129,0.3)] ring-1 ring-emerald-500/30"
-                            : "border-rose-500/50 bg-rose-950/20 shadow-[0_0_15px_-3px_rgba(244,63,94,0.3)] ring-1 ring-rose-500/30"
-                          : "border-white/10 bg-zinc-800/40 hover:bg-zinc-800/70 hover:border-white/20"
-                      } disabled:opacity-50`}
-                    >
-                      <div className="flex items-center justify-between mb-2">
-                        <span className="font-semibold text-xs text-white">
-                          {sample.name}
-                        </span>
-                        <span
-                          className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                            sample.category === "Safe"
-                              ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30"
-                              : "bg-rose-500/20 text-rose-300 border border-rose-500/30"
-                          }`}
-                        >
-                          {sample.category}
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-zinc-400 leading-snug line-clamp-2">
-                        {sample.description}
-                      </p>
-                    </button>
-                  );
-                })}
-              </div>
-
-              {/* Upload Dropzone */}
-              <div
+              {/* Massive Drag-and-Drop Dropzone */}
+              <motion.div
                 id="video-dropzone"
-                onDragOver={(e) => e.preventDefault()}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
                 onDrop={handleDrop}
                 onClick={() => fileInputRef.current?.click()}
-                className={`relative border-2 border-dashed rounded-xl p-4 text-center cursor-pointer transition ${
-                  uploadedFile
-                    ? "border-indigo-500/60 bg-indigo-950/20"
-                    : "border-white/15 bg-black/20 hover:border-white/30 hover:bg-black/30"
+                whileHover={{ scale: 1.005 }}
+                whileTap={{ scale: 0.995 }}
+                className={`relative border-2 border-dashed rounded-2xl p-8 text-center cursor-pointer transition-all duration-300 flex flex-col items-center justify-center gap-3 ${
+                  isDragOver
+                    ? "border-indigo-400 bg-indigo-500/10 shadow-[0_0_30px_rgba(99,102,241,0.25)]"
+                    : uploadedFile
+                    ? "border-emerald-500/40 bg-emerald-500/[0.04]"
+                    : "border-white/[0.12] bg-white/[0.015] hover:border-white/25 hover:bg-white/[0.03]"
                 }`}
               >
                 <input
@@ -366,43 +420,107 @@ python run_live.py`;
                   onChange={handleFileUpload}
                   className="hidden"
                 />
-                <div className="flex flex-col items-center justify-center gap-1.5">
-                  <span className="text-2xl">{uploadedFile ? "📁" : "⬆️"}</span>
+
+                <div className="h-14 w-14 rounded-2xl bg-white/[0.05] border border-white/10 flex items-center justify-center text-zinc-200 shadow-inner">
+                  {uploadedFile ? (
+                    <CheckCircle2 className="h-7 w-7 text-emerald-400" />
+                  ) : (
+                    <UploadCloud className="h-7 w-7 text-zinc-300" />
+                  )}
+                </div>
+
+                <div className="space-y-1">
                   {uploadedFile ? (
                     <div>
-                      <p className="text-xs font-semibold text-indigo-300">
+                      <p className="text-sm font-semibold text-white tracking-tight">
                         {uploadedFile.name}
                       </p>
-                      <p className="text-[10px] text-zinc-400">
-                        {(uploadedFile.size / (1024 * 1024)).toFixed(2)} MB • Ready for analysis
+                      <p className="text-xs text-emerald-400 font-mono mt-0.5">
+                        {(uploadedFile.size / (1024 * 1024)).toFixed(2)} MB • Ready for ST-GCN analysis
                       </p>
                     </div>
                   ) : (
                     <div>
-                      <p className="text-xs font-medium text-zinc-300">
-                        Drag & Drop or Click to Upload Custom Video
+                      <p className="text-sm font-medium text-zinc-200">
+                        Drop video file here, or <span className="text-indigo-400 underline underline-offset-4">browse files</span>
                       </p>
-                      <p className="text-[10px] text-zinc-400">
-                        Supports MP4, AVI, MOV up to 150 MB
+                      <p className="text-xs text-zinc-400 mt-1">
+                        MP4, AVI, or MOV format • Up to 150 MB
                       </p>
                     </div>
                   )}
                 </div>
+              </motion.div>
+
+              {/* Hick's Law: 2 Dedicated Quick Select Buttons */}
+              <div className="space-y-2">
+                <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider block">
+                  Or Test Preset Benchmarks
+                </span>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                  {PRESET_SAMPLES.map((sample) => {
+                    const isSelected = selectedSample?.id === sample.id && !uploadedFile;
+                    const isViolence = sample.category === "Violence";
+
+                    return (
+                      <motion.button
+                        key={sample.id}
+                        id={`sample-btn-${sample.id.replace(/\W/g, "-")}`}
+                        onClick={() => handleSelectSample(sample)}
+                        disabled={isAnalyzing}
+                        whileHover={{ scale: 1.01 }}
+                        whileTap={{ scale: 0.985 }}
+                        className={`relative text-left p-4 rounded-2xl border transition-all duration-300 flex flex-col justify-between ${
+                          isSelected
+                            ? isViolence
+                              ? "border-rose-500/60 bg-rose-950/25 shadow-[0_0_24px_-4px_rgba(244,63,94,0.35)] ring-1 ring-rose-500/40"
+                              : "border-emerald-500/60 bg-emerald-950/25 shadow-[0_0_24px_-4px_rgba(16,185,129,0.35)] ring-1 ring-emerald-500/40"
+                            : "border-white/[0.08] bg-white/[0.02] hover:bg-white/[0.05] hover:border-white/20"
+                        } disabled:opacity-50`}
+                      >
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="font-semibold text-xs text-white tracking-tight flex items-center gap-1.5">
+                            {isViolence ? (
+                              <Flame className="h-3.5 w-3.5 text-rose-400" />
+                            ) : (
+                              <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+                            )}
+                            {sample.name}
+                          </span>
+                          <span
+                            className={`text-[10px] font-semibold px-2.5 py-0.5 rounded-full border ${
+                              isViolence
+                                ? "bg-rose-500/20 text-rose-300 border-rose-500/30"
+                                : "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
+                            }`}
+                          >
+                            {sample.category}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-zinc-400 leading-snug line-clamp-2 font-normal">
+                          {sample.description}
+                        </p>
+                      </motion.button>
+                    );
+                  })}
+                </div>
               </div>
             </div>
 
-            {/* Video Player Preview */}
-            <div className="rounded-2xl border border-white/10 bg-zinc-900/60 p-5 backdrop-blur-md space-y-3">
+            {/* Video Player Preview Glass Card */}
+            <div className="rounded-3xl border border-white/[0.08] bg-white/[0.025] backdrop-blur-2xl p-6 shadow-[0_8px_32px_0_rgba(0,0,0,0.36)] space-y-4">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-zinc-300 flex items-center gap-1.5">
-                  <span>📺</span> Video Preview
-                </span>
-                <span className="text-[11px] text-zinc-400">
+                <div className="flex items-center gap-2">
+                  <Play className="h-4 w-4 text-zinc-300" />
+                  <span className="text-xs font-semibold text-zinc-200">Video Canvas</span>
+                </div>
+                <span className="text-[11px] font-mono text-zinc-400">
                   {uploadedFile ? uploadedFile.name : selectedSample?.name}
                 </span>
               </div>
 
-              <div className="relative aspect-video w-full rounded-xl overflow-hidden bg-black border border-white/10 shadow-lg">
+              {/* Player Container */}
+              <div className="relative aspect-video w-full rounded-2xl overflow-hidden bg-black/90 border border-white/10 shadow-2xl">
                 <video
                   ref={videoRef}
                   id="preview-video-player"
@@ -411,57 +529,54 @@ python run_live.py`;
                   playsInline
                   className="w-full h-full object-contain"
                 />
+
+                {/* Subtle active scanning overlay line if analyzing */}
+                {isAnalyzing && (
+                  <motion.div
+                    className="absolute inset-x-0 h-1 bg-gradient-to-r from-transparent via-indigo-400 to-transparent shadow-[0_0_15px_#818cf8]"
+                    initial={{ top: "0%" }}
+                    animate={{ top: "100%" }}
+                    transition={{
+                      repeat: Infinity,
+                      duration: 1.8,
+                      ease: "linear",
+                    }}
+                  />
+                )}
               </div>
 
-              {/* Start Analysis Button */}
-              <button
+              {/* Primary Analyze Action Button */}
+              <motion.button
                 id="start-analysis-btn"
                 onClick={handleRunAnalysis}
                 disabled={isAnalyzing}
-                className={`w-full py-3.5 px-4 rounded-xl font-bold text-sm tracking-wide transition shadow-lg flex items-center justify-center gap-2.5 ${
+                whileHover={!isAnalyzing ? { scale: 1.01 } : {}}
+                whileTap={!isAnalyzing ? { scale: 0.99 } : {}}
+                className={`w-full py-4 px-6 rounded-2xl font-bold text-sm tracking-wide transition shadow-xl flex items-center justify-center gap-3 ${
                   isAnalyzing
-                    ? "bg-zinc-800 text-zinc-400 cursor-not-allowed border border-white/10"
-                    : "bg-gradient-to-r from-indigo-600 via-indigo-500 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white shadow-indigo-500/25 border border-indigo-400/30 active:scale-[0.99]"
+                    ? "bg-zinc-800/80 text-zinc-400 cursor-not-allowed border border-white/10"
+                    : "bg-white text-zinc-950 hover:bg-zinc-100 shadow-[0_4px_24px_rgba(255,255,255,0.15)] border border-white active:scale-[0.99]"
                 }`}
               >
                 {isAnalyzing ? (
                   <>
-                    <svg
-                      className="animate-spin h-4 w-4 text-indigo-400"
-                      xmlns="http://www.w3.org/2000/svg"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                    >
-                      <circle
-                        className="opacity-25"
-                        cx="12"
-                        cy="12"
-                        r="10"
-                        stroke="currentColor"
-                        strokeWidth="4"
-                      />
-                      <path
-                        className="opacity-75"
-                        fill="currentColor"
-                        d="M4 12a8 8 0 018-8v8H4z"
-                      />
-                    </svg>
-                    <span>Analyzing video kinematics...</span>
+                    <RefreshCw className="h-4 w-4 text-indigo-400 animate-spin" />
+                    <span>Processing Neural Pipeline...</span>
                   </>
                 ) : (
                   <>
-                    <span>⚡</span>
-                    <span>Analyze Video Kinematics</span>
+                    <Zap className="h-4 w-4 text-zinc-900 fill-zinc-900" />
+                    <span>Run Kinematic ST-GCN Analysis</span>
                   </>
                 )}
-              </button>
+              </motion.button>
 
               {errorMsg && (
                 <div
                   id="analysis-error-banner"
-                  className="rounded-xl border border-rose-500/30 bg-rose-950/20 p-3 text-xs text-rose-300 flex items-center gap-2"
+                  className="rounded-2xl border border-rose-500/30 bg-rose-950/20 p-4 text-xs text-rose-300 flex items-center gap-2.5 backdrop-blur-md"
                 >
-                  <span>⚠️</span>
+                  <AlertTriangle className="h-4 w-4 text-rose-400 flex-shrink-0" />
                   <span>{errorMsg}</span>
                 </div>
               )}
@@ -469,207 +584,292 @@ python run_live.py`;
           </div>
 
           {/* Right Column: Detailed Kinematic Analysis Report (5 cols) */}
-          <div className="lg:col-span-5 space-y-5">
-            <div className="rounded-2xl border border-white/10 bg-zinc-900/60 p-5 backdrop-blur-md space-y-4">
-              <div className="flex items-center justify-between pb-2 border-b border-white/10">
-                <h3 className="text-sm font-semibold tracking-wide text-zinc-200 flex items-center gap-2">
-                  <span>📊</span> 2. Analysis Report
-                </h3>
+          <div className="lg:col-span-5 space-y-6">
+            <div className="rounded-3xl border border-white/[0.08] bg-white/[0.025] backdrop-blur-2xl p-6 shadow-[0_8px_32px_0_rgba(0,0,0,0.36)] space-y-5">
+              <div className="flex items-center justify-between pb-3 border-b border-white/[0.08]">
+                <div className="flex items-center gap-2">
+                  <Activity className="h-4 w-4 text-zinc-300" />
+                  <h3 className="text-sm font-semibold tracking-tight text-white">
+                    Telemetry & Verdict
+                  </h3>
+                </div>
                 <span className="text-[11px] font-mono text-zinc-400">
-                  {analysisReport ? `Time: ${analysisReport.processing_time_sec}s` : "Pending Run"}
+                  {analysisReport ? `${analysisReport.processing_time_sec}s runtime` : "Standby"}
                 </span>
               </div>
 
-              {/* State 1: Loading Progress */}
-              {isAnalyzing && (
-                <div id="analyzing-state" className="py-12 px-4 text-center space-y-4">
-                  <div className="relative mx-auto h-16 w-16">
-                    <div className="absolute inset-0 rounded-full border-4 border-indigo-500/20 animate-ping" />
-                    <div className="h-16 w-16 rounded-full border-4 border-indigo-500 border-t-transparent animate-spin" />
-                  </div>
-                  <div>
-                    <h4 className="text-sm font-bold text-white tracking-tight">
-                      Analyzing Video Kinematics
-                    </h4>
-                    <p className="text-xs text-zinc-400 mt-1 max-w-xs mx-auto">
-                      Processing frame-by-frame sequential pose estimation, 1st-order velocities,
-                      2nd-order accelerations, and interaction turbulence...
-                    </p>
-                  </div>
-                </div>
-              )}
-
-              {/* State 2: Idle (No Report Yet) */}
-              {!isAnalyzing && !analysisReport && (
-                <div id="idle-report-state" className="py-12 px-4 text-center space-y-3">
-                  <div className="h-12 w-12 rounded-2xl bg-zinc-800/80 border border-white/10 flex items-center justify-center text-xl mx-auto text-zinc-400">
-                    🔬
-                  </div>
-                  <h4 className="text-sm font-semibold text-zinc-300">
-                    Ready for Kinematic Analysis
-                  </h4>
-                  <p className="text-xs text-zinc-400 max-w-xs mx-auto leading-relaxed">
-                    Select a sample clip or upload an MP4 video, then click &ldquo;Analyze Video Kinematics&rdquo; to generate a full spatio-temporal report.
-                  </p>
-                </div>
-              )}
-
-              {/* State 3: Analysis Report Result */}
-              {!isAnalyzing && analysisReport && (
-                <div id="analysis-report-view" className="space-y-5">
-                  {/* Verdict Card */}
-                  <div
-                    id="verdict-banner"
-                    className={`rounded-xl border p-4.5 text-center shadow-lg transition ${
-                      analysisReport.overall_verdict === "Violence"
-                        ? "border-rose-500/50 bg-gradient-to-b from-rose-950/40 to-black/60 shadow-rose-950/30"
-                        : "border-emerald-500/50 bg-gradient-to-b from-emerald-950/40 to-black/60 shadow-emerald-950/30"
-                    }`}
+              {/* State 1: Active Waiting / Progress State (UX Psychology) */}
+              <AnimatePresence mode="wait">
+                {isAnalyzing && (
+                  <motion.div
+                    key="analyzing-state"
+                    id="analyzing-state"
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    className="py-12 px-4 text-center space-y-5"
                   >
-                    <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-400">
-                      Overall Verdict
-                    </span>
-                    <div
-                      className={`text-2xl font-black tracking-tight mt-1 mb-2 ${
-                        analysisReport.overall_verdict === "Violence"
-                          ? "text-rose-400"
-                          : "text-emerald-400"
-                      }`}
-                    >
-                      {analysisReport.overall_verdict === "Violence"
-                        ? "VIOLENCE DETECTED"
-                        : "NORMAL / SAFE"}
+                    {/* Pulsing Orbital Radar Animation */}
+                    <div className="relative mx-auto h-20 w-20 flex items-center justify-center">
+                      <div className="absolute inset-0 rounded-full border border-indigo-500/20 animate-ping" />
+                      <div className="absolute inset-1 rounded-full border border-indigo-400/30 animate-pulse" />
+                      <motion.div
+                        className="h-20 w-20 rounded-full border-2 border-indigo-400 border-t-transparent"
+                        animate={{ rotate: 360 }}
+                        transition={{ repeat: Infinity, duration: 1.2, ease: "linear" }}
+                      />
+                      <Radar className="h-8 w-8 text-indigo-400 absolute" />
                     </div>
 
-                    {/* Confidence Meter */}
-                    <div className="space-y-1.5 pt-2 border-t border-white/10">
-                      <div className="flex items-center justify-between text-xs">
-                        <span className="text-zinc-400">Confidence Score:</span>
-                        <span className="font-bold font-mono text-white">
-                          {(analysisReport.confidence * 100).toFixed(1)}%
-                        </span>
-                      </div>
-                      <div className="h-2 w-full rounded-full bg-black/60 overflow-hidden border border-white/10">
-                        <div
-                          className={`h-full rounded-full transition-all duration-500 ${
-                            analysisReport.overall_verdict === "Violence"
-                              ? "bg-gradient-to-r from-rose-500 to-amber-500"
-                              : "bg-gradient-to-r from-emerald-500 to-teal-400"
-                          }`}
-                          style={{
-                            width: `${Math.min(100, Math.max(0, analysisReport.confidence * 100))}%`,
-                          }}
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Telemetry Metrics Grid */}
-                  <div className="grid grid-cols-2 gap-2.5 text-xs">
-                    <div className="rounded-xl border border-white/10 bg-black/30 p-3 space-y-1">
-                      <span className="text-zinc-400 text-[11px]">Processing Time</span>
-                      <p className="font-mono font-bold text-white text-sm">
-                        {analysisReport.processing_time_sec}s
-                      </p>
-                    </div>
-                    <div className="rounded-xl border border-white/10 bg-black/30 p-3 space-y-1">
-                      <span className="text-zinc-400 text-[11px]">Frames Analyzed</span>
-                      <p className="font-mono font-bold text-white text-sm">
-                        {analysisReport.frame_count ?? "—"} frames
-                      </p>
-                    </div>
-                    <div className="rounded-xl border border-white/10 bg-black/30 p-3 space-y-1">
-                      <span className="text-zinc-400 text-[11px]">Video Duration</span>
-                      <p className="font-mono font-bold text-white text-sm">
-                        {analysisReport.video_duration_sec ?? "—"}s
-                      </p>
-                    </div>
-                    <div className="rounded-xl border border-white/10 bg-black/30 p-3 space-y-1">
-                      <span className="text-zinc-400 text-[11px]">Peak Probability</span>
-                      <p className="font-mono font-bold text-white text-sm">
-                        {analysisReport.peak_probability
-                          ? `${(analysisReport.peak_probability * 100).toFixed(1)}%`
-                          : "—"}
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Incident Timestamps Section */}
-                  <div className="space-y-2.5">
-                    <div className="flex items-center justify-between">
-                      <h4 className="text-xs font-semibold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5">
-                        <span>⏱️</span> Incident Timestamps
+                    <div className="space-y-2">
+                      <h4 className="text-sm font-bold text-white tracking-tight">
+                        Active Waiting: Neural Evaluation
                       </h4>
-                      <span className="text-[11px] font-mono text-zinc-400">
-                        {analysisReport.incident_timestamps.length} Trigger(s)
-                      </span>
+                      <AnimatePresence mode="wait">
+                        <motion.p
+                          key={scanStepIndex}
+                          initial={{ opacity: 0, y: 4 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: -4 }}
+                          className="text-xs font-mono text-indigo-300 h-5"
+                        >
+                          {SCAN_STEPS[scanStepIndex]}
+                        </motion.p>
+                      </AnimatePresence>
+                      <p className="text-[11px] text-zinc-400 max-w-xs mx-auto leading-relaxed pt-1">
+                        Normalizing COCO-17 keypoint coordinates, computing multi-frame graph convolutions, and validating strike proximity boundaries.
+                      </p>
                     </div>
+                  </motion.div>
+                )}
 
-                    {analysisReport.incident_timestamps.length === 0 ? (
-                      <div className="rounded-xl border border-white/10 bg-black/20 p-3 text-center text-xs text-zinc-400">
-                        No violent kinematic triggers detected. Entire clip is verified secure.
+                {/* State 2: Idle (No Report Yet) */}
+                {!isAnalyzing && !analysisReport && (
+                  <motion.div
+                    key="idle-state"
+                    id="idle-report-state"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    className="py-14 px-4 text-center space-y-3.5"
+                  >
+                    <div className="h-14 w-14 rounded-2xl bg-white/[0.04] border border-white/10 flex items-center justify-center mx-auto text-zinc-400 shadow-inner">
+                      <Sparkles className="h-6 w-6 text-zinc-400" />
+                    </div>
+                    <div>
+                      <h4 className="text-sm font-semibold text-zinc-200 tracking-tight">
+                        Awaiting Ingestion
+                      </h4>
+                      <p className="text-xs text-zinc-400 max-w-xs mx-auto leading-relaxed mt-1">
+                        Select an altercation or safe clip above, or upload custom surveillance footage to inspect kinematic graph predictions.
+                      </p>
+                    </div>
+                  </motion.div>
+                )}
+
+                {/* State 3: Analysis Report Result with Semantic Urgency */}
+                {!isAnalyzing && analysisReport && (
+                  <motion.div
+                    key="report-state"
+                    id="analysis-report-view"
+                    initial={{ opacity: 0, scale: 0.98 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    transition={{ type: "spring", stiffness: 300, damping: 25 }}
+                    className="space-y-6"
+                  >
+                    {/* The Semantic Urgency Verdict Card */}
+                    {analysisReport.overall_verdict === "Violence" ? (
+                      /* High-Contrast Apple System Red */
+                      <div
+                        id="verdict-banner"
+                        className="rounded-2xl border border-rose-500/50 bg-gradient-to-b from-rose-950/40 via-rose-950/20 to-black/60 p-5 text-center shadow-[0_0_35px_rgba(244,63,94,0.3)] backdrop-blur-xl space-y-3"
+                      >
+                        <div className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full bg-rose-500/20 border border-rose-500/30 text-[11px] font-bold uppercase tracking-wider text-rose-300">
+                          <AlertTriangle className="h-3.5 w-3.5 text-rose-400" />
+                          Hostile Kinematics Confirmed
+                        </div>
+
+                        <div className="text-2xl font-black tracking-tight text-rose-400">
+                          VIOLENCE DETECTED
+                        </div>
+
+                        {/* Confidence Meter */}
+                        <div className="space-y-1.5 pt-2 border-t border-rose-500/20">
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="text-zinc-400">Confidence Rating:</span>
+                            <span className="font-bold font-mono text-rose-300">
+                              {(analysisReport.confidence * 100).toFixed(1)}%
+                            </span>
+                          </div>
+                          <div className="h-2 w-full rounded-full bg-black/60 overflow-hidden border border-white/10">
+                            <motion.div
+                              className="h-full rounded-full bg-gradient-to-r from-rose-500 via-red-500 to-amber-500 shadow-[0_0_12px_rgba(244,63,94,0.8)]"
+                              initial={{ width: 0 }}
+                              animate={{ width: `${Math.min(100, Math.max(0, analysisReport.confidence * 100))}%` }}
+                              transition={{ duration: 0.8, ease: "easeOut" }}
+                            />
+                          </div>
+                        </div>
                       </div>
                     ) : (
-                      <div className="space-y-1.5">
-                        <p className="text-[11px] text-zinc-400">
-                          Click any timestamp chip to seek video directly to that incident:
+                      /* Muted, Serene Emerald Safe State */
+                      <div
+                        id="verdict-banner"
+                        className="rounded-2xl border border-emerald-500/30 bg-gradient-to-b from-emerald-950/30 via-emerald-950/10 to-black/60 p-5 text-center shadow-[0_0_25px_rgba(16,185,129,0.2)] backdrop-blur-xl space-y-3"
+                      >
+                        <div className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full bg-emerald-500/20 border border-emerald-500/30 text-[11px] font-bold uppercase tracking-wider text-emerald-300">
+                          <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+                          Normal Kinematics Verified
+                        </div>
+
+                        <div className="text-2xl font-black tracking-tight text-emerald-400">
+                          NORMAL / SECURE
+                        </div>
+
+                        {/* Confidence Meter */}
+                        <div className="space-y-1.5 pt-2 border-t border-emerald-500/20">
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="text-zinc-400">Confidence Rating:</span>
+                            <span className="font-bold font-mono text-emerald-300">
+                              {((1 - analysisReport.confidence) * 100).toFixed(1)}% Safe
+                            </span>
+                          </div>
+                          <div className="h-2 w-full rounded-full bg-black/60 overflow-hidden border border-white/10">
+                            <motion.div
+                              className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-400 shadow-[0_0_12px_rgba(16,185,129,0.7)]"
+                              initial={{ width: 0 }}
+                              animate={{ width: `${Math.min(100, Math.max(0, (1 - analysisReport.confidence) * 100))}%` }}
+                              transition={{ duration: 0.8, ease: "easeOut" }}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Telemetry Metrics Grid */}
+                    <div className="grid grid-cols-2 gap-3 text-xs">
+                      <div className="rounded-2xl border border-white/[0.08] bg-white/[0.02] p-3.5 space-y-1">
+                        <span className="text-zinc-400 text-[11px] flex items-center gap-1">
+                          <Clock className="h-3 w-3 text-zinc-400" />
+                          Processing Time
+                        </span>
+                        <p className="font-mono font-bold text-white text-sm">
+                          {analysisReport.processing_time_sec}s
                         </p>
-                        <div
-                          id="incident-timestamps-list"
-                          className="flex flex-wrap gap-2 max-h-36 overflow-y-auto pr-1"
-                        >
-                          {analysisReport.incident_timestamps.map((ts, idx) => (
-                            <button
-                              key={`ts-${idx}-${ts}`}
-                              onClick={() => seekToTimestamp(ts)}
-                              className="px-2.5 py-1 rounded-lg text-xs font-mono font-bold bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 hover:border-rose-400 transition flex items-center gap-1 active:scale-95"
-                              title={`Jump to ${ts.toFixed(2)}s`}
+                      </div>
+                      <div className="rounded-2xl border border-white/[0.08] bg-white/[0.02] p-3.5 space-y-1">
+                        <span className="text-zinc-400 text-[11px] flex items-center gap-1">
+                          <Layers className="h-3 w-3 text-zinc-400" />
+                          Frames Evaluated
+                        </span>
+                        <p className="font-mono font-bold text-white text-sm">
+                          {analysisReport.frame_count ?? "—"} frames
+                        </p>
+                      </div>
+                      <div className="rounded-2xl border border-white/[0.08] bg-white/[0.02] p-3.5 space-y-1">
+                        <span className="text-zinc-400 text-[11px] flex items-center gap-1">
+                          <Film className="h-3 w-3 text-zinc-400" />
+                          Duration / FPS
+                        </span>
+                        <p className="font-mono font-bold text-white text-sm">
+                          {analysisReport.video_duration_sec ?? "—"}s ({analysisReport.video_fps ?? 30} fps)
+                        </p>
+                      </div>
+                      <div className="rounded-2xl border border-white/[0.08] bg-white/[0.02] p-3.5 space-y-1">
+                        <span className="text-zinc-400 text-[11px] flex items-center gap-1">
+                          <Activity className="h-3 w-3 text-zinc-400" />
+                          Peak Probability
+                        </span>
+                        <p className="font-mono font-bold text-white text-sm">
+                          {analysisReport.peak_probability
+                            ? `${(analysisReport.peak_probability * 100).toFixed(1)}%`
+                            : "—"}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Incident Timestamps Section */}
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-xs font-semibold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5">
+                          <Clock className="h-3.5 w-3.5 text-zinc-400" />
+                          Incident Triggers
+                        </h4>
+                        <span className="text-[11px] font-mono text-zinc-400">
+                          {analysisReport.incident_timestamps.length} Detected
+                        </span>
+                      </div>
+
+                      {analysisReport.incident_timestamps.length === 0 ? (
+                        <div className="rounded-2xl border border-white/[0.08] bg-white/[0.02] p-4 text-center text-xs text-zinc-400">
+                          No violent kinetic spikes breached the Relational Strike Gate.
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          <p className="text-[11px] text-zinc-400">
+                            Click any incident pill to jump directly to the altercation moment:
+                          </p>
+                          <div
+                            id="incident-timestamps-list"
+                            className="flex flex-wrap gap-2 max-h-36 overflow-y-auto pr-1"
+                          >
+                            {analysisReport.incident_timestamps.map((ts, idx) => (
+                              <motion.button
+                                key={`ts-${idx}-${ts}`}
+                                onClick={() => seekToTimestamp(ts)}
+                                whileHover={{ scale: 1.05 }}
+                                whileTap={{ scale: 0.95 }}
+                                className="px-3 py-1.5 rounded-full text-xs font-mono font-bold bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 hover:border-rose-300 transition flex items-center gap-1.5 shadow-sm"
+                                title={`Jump to ${ts.toFixed(2)}s`}
+                              >
+                                <Flame className="h-3 w-3 text-rose-400" />
+                                <span>{ts.toFixed(2)}s</span>
+                              </motion.button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Timeline Breakdown */}
+                    {analysisReport.timeline && analysisReport.timeline.length > 0 && (
+                      <div className="space-y-2.5 pt-2 border-t border-white/[0.08]">
+                        <span className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
+                          Sampled Sequence Telemetry
+                        </span>
+                        <div className="max-h-48 overflow-y-auto space-y-1.5 pr-1 font-mono text-[11px]">
+                          {analysisReport.timeline.map((point, idx) => (
+                            <div
+                              key={`tl-${idx}`}
+                              onClick={() => seekToTimestamp(point.timestamp)}
+                              className={`flex items-center justify-between p-2.5 rounded-xl border cursor-pointer transition ${
+                                point.is_fighting
+                                  ? "bg-rose-950/20 border-rose-500/30 text-rose-300 hover:bg-rose-950/30"
+                                  : "bg-white/[0.02] border-white/[0.06] text-zinc-400 hover:bg-white/[0.05]"
+                              }`}
                             >
-                              <span>🚨</span>
-                              <span>{ts.toFixed(2)}s</span>
-                            </button>
+                              <span className="font-bold">{(point.timestamp ?? 0).toFixed(2)}s</span>
+                              <span>P: {((point.probability ?? 0) * 100).toFixed(0)}%</span>
+                              {point.min_strike_dist !== undefined && point.min_strike_dist < 9000 && (
+                                <span>Dist: {point.min_strike_dist.toFixed(0)}px</span>
+                              )}
+                              <span
+                                className={`px-2 py-0.5 rounded-full text-[10px] font-sans font-bold ${
+                                  point.is_fighting
+                                    ? "bg-rose-500 text-white shadow-[0_0_8px_rgba(244,63,94,0.6)]"
+                                    : "bg-white/10 text-zinc-300"
+                                }`}
+                              >
+                                {point.is_fighting ? "ALERT" : "SECURE"}
+                              </span>
+                            </div>
                           ))}
                         </div>
                       </div>
                     )}
-                  </div>
-
-                  {/* Keyframe Timeline Breakdown */}
-                  {analysisReport.timeline && analysisReport.timeline.length > 0 && (
-                    <div className="space-y-2 pt-2 border-t border-white/10">
-                      <span className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
-                        Kinematic Timeline Events
-                      </span>
-                      <div className="max-h-40 overflow-y-auto space-y-1.5 pr-1 font-mono text-[11px]">
-                        {analysisReport.timeline.map((point, idx) => (
-                          <div
-                            key={`tl-${idx}`}
-                            onClick={() => seekToTimestamp(point.timestamp)}
-                            className={`flex items-center justify-between p-2 rounded-lg border cursor-pointer transition ${
-                              point.is_fighting
-                                ? "bg-rose-950/20 border-rose-500/30 text-rose-300 hover:bg-rose-950/30"
-                                : "bg-black/30 border-white/5 text-zinc-400 hover:bg-black/50"
-                            }`}
-                          >
-                            <span className="font-bold">{(point.timestamp ?? 0).toFixed(2)}s</span>
-                            <span>Prob: {((point.probability ?? 0) * 100).toFixed(0)}%</span>
-                            <span>Bio: {(point.bio_score ?? point.probability ?? 0).toFixed(2)}</span>
-                            <span
-                              className={`px-1.5 py-0.5 rounded text-[10px] font-sans font-bold ${
-                                point.is_fighting
-                                  ? "bg-rose-500 text-white"
-                                  : "bg-white/10 text-zinc-300"
-                              }`}
-                            >
-                              {point.is_fighting ? "ALERT" : "SAFE"}
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </div>
           </div>
         </div>

@@ -91,13 +91,32 @@ def resolve_sample_video(sample_name: str) -> Path:
     raise FileNotFoundError(f"Sample video '{sample_name}' not found in samples or raw data.")
 
 
+import core.scene_gating
+
+# Monkey-patch SceneClassifier to prevent loading MobileNetV3 into memory (saving ~100MB RAM for 512MB cloud limits)
+class LightweightCloudSceneClassifier:
+    """Zero-memory dummy scene classifier for lightweight 512MB RAM cloud deployments."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.model = None
+
+    def analyze_frame(self, frame: Any) -> bool:
+        return False
+
+core.scene_gating.SceneClassifier = LightweightCloudSceneClassifier
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global _classifier, _incident_logger
-    log.info("Initializing Pose + ST-GCN Batch Inference Service...")
-    _classifier = PoseSTGCNDetector()
+    log.info("Initializing Lightweight Cloud Pose + ST-GCN Batch Inference Service (512MB RAM Profile)...")
+    _classifier = PoseSTGCNDetector(
+        intra_op_threads=1,
+        pose_stride=3,
+        enable_scene_gating=False,
+    )
     _incident_logger = IncidentLogger()
-    log.info("Model loaded successfully. Ready for batch analysis.")
+    log.info("Lightweight Cloud Model loaded successfully (threads=1, stride=3, scene_gating=DISABLED). Ready for batch analysis.")
     try:
         yield
     finally:

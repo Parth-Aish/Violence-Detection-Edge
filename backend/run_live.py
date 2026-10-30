@@ -159,8 +159,8 @@ def main() -> None:
     parser.add_argument(
         "--stride",
         type=int,
-        default=2,
-        help="Pose estimation frame stride (default=2 for 50+ FPS throughput).",
+        default=1,
+        help="Pose estimation frame stride (default=1 for maximum accuracy and zero skipped frames).",
     )
     parser.add_argument(
         "--threads",
@@ -209,11 +209,16 @@ def main() -> None:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
         cap.set(cv2.CAP_PROP_FPS, 30.0)
 
-    # Unlock full CPU threads for 50+ FPS throughput
+    # Maximize CPU threads and accuracy for Heavyweight Local Edge
     available_cores = os.cpu_count() or 4
-    threads = args.threads or available_cores
-    print(f"[EDGE-AI] Initializing PoseSTGCNDetector (threads={threads}, stride={args.stride})...")
-    detector = PoseSTGCNDetector(intra_op_threads=threads, pose_stride=max(1, args.stride))
+    threads = args.threads if args.threads is not None else available_cores
+    stride = max(1, args.stride)
+    print(f"[EDGE-AI] Initializing Heavyweight PoseSTGCNDetector (threads={threads}, stride={stride}, scene_gating=ON)...")
+    detector = PoseSTGCNDetector(
+        intra_op_threads=threads,
+        pose_stride=stride,
+        enable_scene_gating=True,
+    )
 
     window_name = "Edge Vision - Real-Time ST-GCN & Relational Strike Detection"
     gui_available = not args.headless

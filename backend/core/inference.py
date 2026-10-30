@@ -148,6 +148,7 @@ class PoseSTGCNDetector:
         threshold: float = VIOLENCE_THRESHOLD,
         intra_op_threads: Optional[int] = None,
         pose_stride: int = POSE_STRIDE,
+        enable_scene_gating: bool = True,
     ):
         base_dir = Path(__file__).resolve().parent.parent
 
@@ -229,7 +230,11 @@ class PoseSTGCNDetector:
         self._last_prediction: Optional[ViolencePrediction] = None
 
         # Scene Context Gating & Multi-Object Occlusion Tracker
-        self.scene_classifier = SceneClassifier()
+        self.enable_scene_gating = enable_scene_gating
+        if self.enable_scene_gating:
+            self.scene_classifier = SceneClassifier()
+        else:
+            self.scene_classifier = None
         self.tracker = OcclusionKalmanTracker(max_age=10)
         self._is_sports_context: bool = False
 
@@ -365,8 +370,10 @@ class PoseSTGCNDetector:
             self._last_time = now
 
             # Scene Context Gating check (1 FPS / every 30 frames)
-            if self._frame_index % 30 == 0:
+            if self.enable_scene_gating and self.scene_classifier is not None and self._frame_index % 30 == 0:
                 self._is_sports_context = self.scene_classifier.analyze_frame(frame)
+            elif not self.enable_scene_gating:
+                self._is_sports_context = False
 
             # Stride logic: run pose extraction every pose_stride frames
             should_extract_pose = (self._frame_index % self.pose_stride == 0) or (
