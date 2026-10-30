@@ -8,13 +8,23 @@ by classifying scene context at 1 FPS with minimal CPU overhead (~14ms).
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 import numpy as np
-import torch
-import torch.nn as nn
-from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
+
+try:
+    import torch
+    import torch.nn as nn
+    from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
+
+    HAS_TORCH = True
+except (ImportError, ModuleNotFoundError):
+    torch = None  # type: ignore
+    nn = None  # type: ignore
+    MobileNet_V3_Small_Weights = None  # type: ignore
+    mobilenet_v3_small = None  # type: ignore
+    HAS_TORCH = False
 
 logger = logging.getLogger("core.scene_gating")
 
@@ -57,8 +67,16 @@ class SceneClassifier:
     """Lightweight CPU-optimized scene context classifier."""
 
     def __init__(self, device: str = "cpu"):
+        if not HAS_TORCH:
+            logger.info("PyTorch not installed. Scene gating gracefully disabled.")
+            self.device = None
+            self.model: Optional[Any] = None
+            self.mean: Optional[np.ndarray] = None
+            self.std: Optional[np.ndarray] = None
+            return
+
         self.device = torch.device(device)
-        self.model: Optional[nn.Module] = None
+        self.model: Optional[Any] = None
         self._load_model()
 
         # ImageNet normalization parameters
@@ -67,6 +85,10 @@ class SceneClassifier:
 
     def _load_model(self) -> None:
         """Initialize MobileNetV3-Small in evaluation mode."""
+        if not HAS_TORCH:
+            self.model = None
+            return
+
         try:
             weights = MobileNet_V3_Small_Weights.DEFAULT
             model = mobilenet_v3_small(weights=weights)
@@ -87,7 +109,7 @@ class SceneClassifier:
         Returns True if the scene indicates a sport or controlled athletic environment,
         otherwise False.
         """
-        if self.model is None or frame is None or frame.size == 0:
+        if not HAS_TORCH or self.model is None or frame is None or frame.size == 0:
             return False
 
         try:
