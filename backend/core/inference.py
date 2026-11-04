@@ -158,7 +158,6 @@ class PoseSTGCNDetector:
             Path(os.environ.get("STGCN_MODEL_PATH", "")) if os.environ.get("STGCN_MODEL_PATH") else None,
             base_dir / "models" / "violence_stgcn.onnx",
             base_dir / "violence_stgcn.onnx",
-            base_dir / "violence_lstm_v2.onnx",  # Fallback if ST-GCN not yet exported
         ]
         chosen_model = next((p for p in candidate_models if p and p.is_file()), None)
         if not chosen_model:

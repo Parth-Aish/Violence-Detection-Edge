@@ -97,13 +97,13 @@ def main() -> None:
         option_cloud_dashboard()
     elif choice == "2":
         print("\n[LAUNCHER] Starting live webcam edge surveillance...")
-        run_command([sys.executable, "run_live.py", "--source", "0"])
+        run_command([sys.executable, "backend/run_live.py", "--source", "0"])
     elif choice == "3":
         sample = Path("data/raw/Violence/V_1.mp4")
         if not sample.is_file():
             sample = Path("frontend/public/samples/violence_sample.mp4")
         print(f"\n[LAUNCHER] Starting edge playback on sample: {sample}...")
-        run_command([sys.executable, "run_live.py", "--source", str(sample)])
+        run_command([sys.executable, "backend/run_live.py", "--source", str(sample)])
     elif choice == "4":
         print("\n[LAUNCHER] Running automated concat benchmark test...")
         run_command([sys.executable, "backend/benchmark_tests.py"])

@@ -15,7 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FRAME_HEIGHT=480 \
     FRAME_FPS=15 \
     POSE_STRIDE=2 \
-    ONNX_MODEL_PATH=/app/backend/violence_lstm.onnx \
+    ONNX_MODEL_PATH=/app/backend/models/violence_stgcn.onnx \
     POSE_MODEL_PATH=/app/backend/yolov8n-pose.onnx \
     ONNX_INTRA_OP_THREADS=1 \
     ORT_THREADS=1 \
@@ -38,7 +38,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ /app/backend/
 COPY --from=frontend-builder /build/out /app/frontend/out/
-RUN test -s /app/backend/violence_lstm.onnx \
+RUN test -s /app/backend/models/violence_stgcn.onnx \
     && test -s /app/backend/yolov8n-pose.onnx \
     && mkdir -p /app/backend/data \
     && chown -R user:user /app

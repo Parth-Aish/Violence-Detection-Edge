@@ -63,7 +63,7 @@ This document records the architectural shifts and engineering rationale for the
   - `backend/core/transforms.py`: Implements mid-hip root-centering and torso-scale normalization, converting raw `(N, 30, 34)` keypoints into ST-GCN tensor format `(N, 2, 30, 17)`.
   - `backend/core/inference.py`: Implements unified batch and frame-level inference leveraging the exact same modules.
 - **Impact:**
-  - Eliminates code duplication across training (`dataset_prep.py`, `train_stgcn.py`) and deployment (`main.py`, `run_live.py`).
+  - Eliminates code duplication across training (`train_stgcn.py`) and deployment (`main.py`, `run_live.py`).
   - Ensures 100% mathematical parity between offline model evaluation and live edge execution.
 
 ---
