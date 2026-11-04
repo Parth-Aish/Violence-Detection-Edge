@@ -27,13 +27,8 @@ import {
 } from "lucide-react";
 
 // ─── API Config ─────────────────────────────────────────────────────────────
-const API_URL =
-  process.env.NEXT_PUBLIC_API_URL ??
-  (typeof window !== "undefined" && window.location.port === "3000"
-    ? `${window.location.protocol}//${window.location.hostname}:8000`
-    : typeof window !== "undefined"
-      ? window.location.origin
-      : "http://localhost:8000");
+const RAW_API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+const API_URL = RAW_API_URL.replace(/\/+$/, "");
 
 // ─── Data Types ─────────────────────────────────────────────────────────────
 interface TimelinePoint {
@@ -229,28 +224,45 @@ export default function AppleGradeVisionDashboard() {
       });
 
       if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.detail || `Server returned error status ${res.status}`);
+        let errorDetail = `Server returned error status ${res.status}`;
+        try {
+          const errJson = await res.json();
+          if (errJson?.detail) {
+            errorDetail = typeof errJson.detail === "string" ? errJson.detail : JSON.stringify(errJson.detail);
+          }
+        } catch {
+          const text = await res.text().catch(() => "");
+          if (res.status === 404 || text.includes("404")) {
+            errorDetail = `Backend endpoint not found (404). Please ensure the backend is running and NEXT_PUBLIC_API_URL is configured properly (attempted: ${API_URL}/api/analyze_video).`;
+          }
+        }
+        throw new Error(errorDetail);
       }
 
       const report: AnalysisReport = await res.json();
+      if (!report || typeof report !== "object") {
+        throw new Error("Invalid response format received from inference service.");
+      }
+
       setAnalysisReport(report);
 
       // Jump video to first incident
-      if (report.incident_timestamps && report.incident_timestamps.length > 0 && videoRef.current) {
-        videoRef.current.currentTime = Math.max(0, report.incident_timestamps[0] - 0.5);
+      const triggers = report?.incident_timestamps ?? [];
+      if (Array.isArray(triggers) && triggers.length > 0 && videoRef.current) {
+        videoRef.current.currentTime = Math.max(0, (triggers[0] ?? 0) - 0.5);
       }
     } catch (err: any) {
-      setErrorMsg(err.message || "Failed to process video analysis.");
+      setErrorMsg(err?.message || "Failed to process video analysis. Please check your backend connection.");
+      setAnalysisReport(null);
     } finally {
       setIsAnalyzing(false);
     }
   };
 
   // Jump video to timestamp
-  const seekToTimestamp = (sec: number) => {
+  const seekToTimestamp = (sec: number | undefined | null) => {
     if (videoRef.current) {
-      videoRef.current.currentTime = Math.max(0, sec);
+      videoRef.current.currentTime = Math.max(0, sec ?? 0);
       videoRef.current.play().catch(() => {});
     }
   };
@@ -436,7 +448,7 @@ python run_live.py --source 0`;
                         {uploadedFile.name}
                       </p>
                       <p className="text-xs text-emerald-400 font-mono mt-0.5">
-                        {(uploadedFile.size / (1024 * 1024)).toFixed(2)} MB • Ready for ST-GCN analysis
+                        {(((uploadedFile?.size ?? 0) / (1024 * 1024))).toFixed(2)} MB • Ready for ST-GCN analysis
                       </p>
                     </div>
                   ) : (
@@ -594,7 +606,7 @@ python run_live.py --source 0`;
                   </h3>
                 </div>
                 <span className="text-[11px] font-mono text-zinc-400">
-                  {analysisReport ? `${analysisReport.processing_time_sec}s runtime` : "Standby"}
+                  {analysisReport ? `${analysisReport?.processing_time_sec ?? 0}s runtime` : "Standby"}
                 </span>
               </div>
 
@@ -698,14 +710,14 @@ python run_live.py --source 0`;
                           <div className="flex items-center justify-between text-xs">
                             <span className="text-zinc-400">Confidence Rating:</span>
                             <span className="font-bold font-mono text-rose-300">
-                              {(analysisReport.confidence * 100).toFixed(1)}%
+                              {(((analysisReport?.confidence ?? 0) * 100)).toFixed(1)}%
                             </span>
                           </div>
                           <div className="h-2 w-full rounded-full bg-black/60 overflow-hidden border border-white/10">
                             <motion.div
                               className="h-full rounded-full bg-gradient-to-r from-rose-500 via-red-500 to-amber-500 shadow-[0_0_12px_rgba(244,63,94,0.8)]"
                               initial={{ width: 0 }}
-                              animate={{ width: `${Math.min(100, Math.max(0, analysisReport.confidence * 100))}%` }}
+                              animate={{ width: `${Math.min(100, Math.max(0, (analysisReport?.confidence ?? 0) * 100))}%` }}
                               transition={{ duration: 0.8, ease: "easeOut" }}
                             />
                           </div>
@@ -731,14 +743,14 @@ python run_live.py --source 0`;
                           <div className="flex items-center justify-between text-xs">
                             <span className="text-zinc-400">Confidence Rating:</span>
                             <span className="font-bold font-mono text-emerald-300">
-                              {((1 - analysisReport.confidence) * 100).toFixed(1)}% Safe
+                              {(((1 - (analysisReport?.confidence ?? 0)) * 100)).toFixed(1)}% Safe
                             </span>
                           </div>
                           <div className="h-2 w-full rounded-full bg-black/60 overflow-hidden border border-white/10">
                             <motion.div
                               className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-400 shadow-[0_0_12px_rgba(16,185,129,0.7)]"
                               initial={{ width: 0 }}
-                              animate={{ width: `${Math.min(100, Math.max(0, (1 - analysisReport.confidence) * 100))}%` }}
+                              animate={{ width: `${Math.min(100, Math.max(0, (1 - (analysisReport?.confidence ?? 0)) * 100))}%` }}
                               transition={{ duration: 0.8, ease: "easeOut" }}
                             />
                           </div>
@@ -754,7 +766,7 @@ python run_live.py --source 0`;
                           Processing Time
                         </span>
                         <p className="font-mono font-bold text-white text-sm">
-                          {analysisReport.processing_time_sec}s
+                          {analysisReport?.processing_time_sec ?? 0}s
                         </p>
                       </div>
                       <div className="rounded-2xl border border-white/[0.08] bg-white/[0.02] p-3.5 space-y-1">
@@ -763,7 +775,7 @@ python run_live.py --source 0`;
                           Frames Evaluated
                         </span>
                         <p className="font-mono font-bold text-white text-sm">
-                          {analysisReport.frame_count ?? "—"} frames
+                          {analysisReport?.frame_count ?? "—"} frames
                         </p>
                       </div>
                       <div className="rounded-2xl border border-white/[0.08] bg-white/[0.02] p-3.5 space-y-1">
@@ -772,7 +784,7 @@ python run_live.py --source 0`;
                           Duration / FPS
                         </span>
                         <p className="font-mono font-bold text-white text-sm">
-                          {analysisReport.video_duration_sec ?? "—"}s ({analysisReport.video_fps ?? 30} fps)
+                          {analysisReport?.video_duration_sec ?? "—"}s ({analysisReport?.video_fps ?? 30} fps)
                         </p>
                       </div>
                       <div className="rounded-2xl border border-white/[0.08] bg-white/[0.02] p-3.5 space-y-1">
@@ -781,8 +793,8 @@ python run_live.py --source 0`;
                           Peak Probability
                         </span>
                         <p className="font-mono font-bold text-white text-sm">
-                          {analysisReport.peak_probability
-                            ? `${(analysisReport.peak_probability * 100).toFixed(1)}%`
+                          {analysisReport?.peak_probability != null
+                            ? `${(((analysisReport?.peak_probability ?? 0) * 100)).toFixed(1)}%`
                             : "—"}
                         </p>
                       </div>
@@ -796,11 +808,11 @@ python run_live.py --source 0`;
                           Incident Triggers
                         </h4>
                         <span className="text-[11px] font-mono text-zinc-400">
-                          {analysisReport.incident_timestamps.length} Detected
+                          {(analysisReport?.incident_timestamps ?? []).length} Detected
                         </span>
                       </div>
 
-                      {analysisReport.incident_timestamps.length === 0 ? (
+                      {(analysisReport?.incident_timestamps ?? []).length === 0 ? (
                         <div className="rounded-2xl border border-white/[0.08] bg-white/[0.02] p-4 text-center text-xs text-zinc-400">
                           No violent kinetic spikes breached the Relational Strike Gate.
                         </div>
@@ -813,17 +825,17 @@ python run_live.py --source 0`;
                             id="incident-timestamps-list"
                             className="flex flex-wrap gap-2 max-h-36 overflow-y-auto pr-1"
                           >
-                            {analysisReport.incident_timestamps.map((ts, idx) => (
+                            {(analysisReport?.incident_timestamps ?? []).map((ts, idx) => (
                               <motion.button
                                 key={`ts-${idx}-${ts}`}
-                                onClick={() => seekToTimestamp(ts)}
+                                onClick={() => seekToTimestamp(ts ?? 0)}
                                 whileHover={{ scale: 1.05 }}
                                 whileTap={{ scale: 0.95 }}
                                 className="px-3 py-1.5 rounded-full text-xs font-mono font-bold bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 hover:border-rose-300 transition flex items-center gap-1.5 shadow-sm"
-                                title={`Jump to ${ts.toFixed(2)}s`}
+                                title={`Jump to ${(ts ?? 0).toFixed(2)}s`}
                               >
                                 <Flame className="h-3 w-3 text-rose-400" />
-                                <span>{ts.toFixed(2)}s</span>
+                                <span>{(ts ?? 0).toFixed(2)}s</span>
                               </motion.button>
                             ))}
                           </div>
@@ -832,35 +844,35 @@ python run_live.py --source 0`;
                     </div>
 
                     {/* Timeline Breakdown */}
-                    {analysisReport.timeline && analysisReport.timeline.length > 0 && (
+                    {(analysisReport?.timeline ?? []).length > 0 && (
                       <div className="space-y-2.5 pt-2 border-t border-white/[0.08]">
                         <span className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
                           Sampled Sequence Telemetry
                         </span>
                         <div className="max-h-48 overflow-y-auto space-y-1.5 pr-1 font-mono text-[11px]">
-                          {analysisReport.timeline.map((point, idx) => (
+                          {(analysisReport?.timeline ?? []).map((point, idx) => (
                             <div
                               key={`tl-${idx}`}
-                              onClick={() => seekToTimestamp(point.timestamp)}
+                              onClick={() => seekToTimestamp(point?.timestamp ?? 0)}
                               className={`flex items-center justify-between p-2.5 rounded-xl border cursor-pointer transition ${
-                                point.is_fighting
+                                point?.is_fighting
                                   ? "bg-rose-950/20 border-rose-500/30 text-rose-300 hover:bg-rose-950/30"
                                   : "bg-white/[0.02] border-white/[0.06] text-zinc-400 hover:bg-white/[0.05]"
                               }`}
                             >
-                              <span className="font-bold">{(point.timestamp ?? 0).toFixed(2)}s</span>
-                              <span>P: {((point.probability ?? 0) * 100).toFixed(0)}%</span>
-                              {point.min_strike_dist !== undefined && point.min_strike_dist < 9000 && (
-                                <span>Dist: {point.min_strike_dist.toFixed(0)}px</span>
+                              <span className="font-bold">{(point?.timestamp ?? 0).toFixed(2)}s</span>
+                              <span>P: {(((point?.probability ?? 0) * 100)).toFixed(0)}%</span>
+                              {point?.min_strike_dist !== undefined && point?.min_strike_dist !== null && (point?.min_strike_dist ?? 9999) < 9000 && (
+                                <span>Dist: {(point?.min_strike_dist ?? 0).toFixed(0)}px</span>
                               )}
                               <span
                                 className={`px-2 py-0.5 rounded-full text-[10px] font-sans font-bold ${
-                                  point.is_fighting
+                                  point?.is_fighting
                                     ? "bg-rose-500 text-white shadow-[0_0_8px_rgba(244,63,94,0.6)]"
                                     : "bg-white/10 text-zinc-300"
                                 }`}
                               >
-                                {point.is_fighting ? "ALERT" : "SECURE"}
+                                {point?.is_fighting ? "ALERT" : "SECURE"}
                               </span>
                             </div>
                           ))}
