@@ -29,7 +29,18 @@ import {
 // ─── API Config ─────────────────────────────────────────────────────────────
 const RAW_API_URL =
   process.env.NEXT_PUBLIC_API_URL || "https://violence-detection-edge.onrender.com";
-const API_URL = RAW_API_URL.replace(/\/+$/, "");
+
+// Sanitizes base URL and eliminates double slashes (e.g. //api/health -> /api/health)
+const getApiUrl = (endpoint: string = ""): string => {
+  const base = (RAW_API_URL || "https://violence-detection-edge.onrender.com")
+    .trim()
+    .replace(/\/+$/, "");
+  if (!endpoint) return base;
+  const cleanEndpoint = endpoint.trim().replace(/^\/+/, "");
+  return `${base}/${cleanEndpoint}`;
+};
+
+const API_URL = getApiUrl();
 
 // ─── Data Types ─────────────────────────────────────────────────────────────
 interface TimelinePoint {
@@ -114,7 +125,7 @@ export default function AppleGradeVisionDashboard() {
   useEffect(() => {
     async function checkHealth() {
       try {
-        const res = await fetch(`${API_URL}/api/health`);
+        const res = await fetch(getApiUrl("/api/health"));
         setApiConnected(res.ok);
       } catch {
         setApiConnected(false);
@@ -219,7 +230,7 @@ export default function AppleGradeVisionDashboard() {
         throw new Error("No video selected for analysis.");
       }
 
-      const res = await fetch(`${API_URL}/api/analyze_video`, {
+      const res = await fetch(getApiUrl("/api/analyze_video"), {
         method: "POST",
         body: formData,
       });
@@ -234,7 +245,7 @@ export default function AppleGradeVisionDashboard() {
         } catch {
           const text = await res.text().catch(() => "");
           if (res.status === 404 || text.includes("404")) {
-            errorDetail = `Backend endpoint not found (404). Please ensure the backend is running and NEXT_PUBLIC_API_URL is configured properly (attempted: ${API_URL}/api/analyze_video).`;
+            errorDetail = `Backend endpoint not found (404). Please ensure the backend is running and NEXT_PUBLIC_API_URL is configured properly (attempted: ${getApiUrl("/api/analyze_video")}).`;
           }
         }
         throw new Error(errorDetail);

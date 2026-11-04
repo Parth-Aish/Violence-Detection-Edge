@@ -125,22 +125,37 @@ async def lifespan(_: FastAPI):
         _incident_logger = None
 
 
+import re
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+
 app = FastAPI(
     title="AI Video Kinematics & Incident Analysis Service",
     version="4.0.0",
     lifespan=lifespan,
 )
 
+# ─── CORS Middleware (Allows all origins, credentials, methods, and headers) ──
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allows all origins (including Vercel)
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["*"],  # Allows OPTIONS, POST, GET, etc.
     allow_headers=["*"],
 )
 
 
+@app.middleware("http")
+async def normalize_slashes_middleware(request: Request, call_next: Any):
+    """Normalize multiple consecutive slashes (e.g. //api/health -> /api/health)."""
+    raw_path = request.scope.get("path", "")
+    if "//" in raw_path:
+        request.scope["path"] = re.sub(r"/+", "/", raw_path)
+    return await call_next(request)
+
+
 @app.get("/api/health")
+@app.get("/health")
 async def health_check() -> dict[str, Any]:
     return {
         "status": "running" if _classifier is not None else "starting",
@@ -156,6 +171,7 @@ async def health_check() -> dict[str, Any]:
 
 
 @app.get("/api/samples")
+@app.get("/samples")
 async def list_samples() -> dict[str, Any]:
     """Return available sample clips for quick testing."""
     samples = [
@@ -192,6 +208,7 @@ class AnalyzeRequest(BaseModel):
 
 
 @app.post("/api/analyze_video")
+@app.post("/analyze_video")
 async def analyze_video_endpoint(
     file: Optional[UploadFile] = File(None),
     sample_name: Optional[str] = Form(None),
