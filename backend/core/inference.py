@@ -352,6 +352,7 @@ class PoseSTGCNDetector:
         frame: np.ndarray,
         timestamp: Optional[float] = None,
         dt: Optional[float] = None,
+        stride: Optional[int] = None,
         **kwargs: Any,
     ) -> ViolencePrediction:
         """Process a single frame through YOLO pose detection and ST-GCN inference."""
@@ -374,8 +375,9 @@ class PoseSTGCNDetector:
             elif not self.enable_scene_gating:
                 self._is_sports_context = False
 
-            # Stride logic: run pose extraction every pose_stride frames
-            should_extract_pose = (self._frame_index % self.pose_stride == 0) or (
+            # Stride logic: run pose extraction every stride frames (defaults to self.pose_stride)
+            effective_stride = max(1, stride if stride is not None else self.pose_stride)
+            should_extract_pose = (self._frame_index % effective_stride == 0) or (
                 len(self._poses) < SEQUENCE_LENGTH
             )
             self._frame_index += 1
@@ -595,7 +597,7 @@ class PoseSTGCNDetector:
                 break
 
             cur_time = frame_idx / fps
-            pred = self.process_frame(frame, timestamp=cur_time)
+            pred = self.process_frame(frame, timestamp=cur_time, stride=stride)
 
             if pred.probability > peak_prob:
                 peak_prob = pred.probability
@@ -630,7 +632,7 @@ class PoseSTGCNDetector:
                 unique_incidents.append(ts)
 
         effective_threshold = 0.85 if self._is_sports_context else self.threshold
-        is_violent = len(unique_incidents) > 0 or peak_prob >= effective_threshold
+        is_violent = len(unique_incidents) > 0
         overall_verdict = "Violence" if is_violent else "Safe"
         confidence = round(peak_prob, 3) if is_violent else round(1.0 - peak_prob, 3)
 

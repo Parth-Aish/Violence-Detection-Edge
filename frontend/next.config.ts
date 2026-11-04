@@ -45,22 +45,6 @@ syncOnnxWasmBinaries();
 const nextConfig: NextConfig = {
   output: "export",
 
-  /**
-   * COOP + COEP headers required for SharedArrayBuffer,
-   * which onnxruntime-web needs for multi-threaded WASM.
-   */
-  async headers() {
-    return [
-      {
-        source: "/(.*)",
-        headers: [
-          { key: "Cross-Origin-Opener-Policy",  value: "same-origin" },
-          { key: "Cross-Origin-Embedder-Policy", value: "require-corp" },
-        ],
-      },
-    ];
-  },
-
   turbopack: {
     rules: {
       "*.css": {

@@ -135,12 +135,44 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ─── CORS Middleware (Allows all origins, credentials, methods, and headers) ──
+# ─── CORS Configuration ──────────────────────────────────────────────────────
+# Read allowed origins from environment variable (comma-separated) or production defaults.
+# Strict policy: never combine allow_origins=["*"] with allow_credentials=True.
+_env_origins = os.getenv("ALLOWED_ORIGINS", "")
+allowed_origins: list[str] = [
+    origin.strip() for origin in _env_origins.split(",") if origin.strip()
+]
+
+# Standard local development origins
+_default_dev_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+for origin in _default_dev_origins:
+    if origin not in allowed_origins:
+        allowed_origins.append(origin)
+
+# Add explicit frontend / Vercel environment URLs if specified
+_frontend_url = os.getenv("FRONTEND_URL")
+if _frontend_url and _frontend_url.strip() not in allowed_origins:
+    allowed_origins.append(_frontend_url.strip())
+
+_vercel_url = os.getenv("VERCEL_URL")
+if _vercel_url:
+    clean_vercel = _vercel_url.strip()
+    if not clean_vercel.startswith("http"):
+        clean_vercel = f"https://{clean_vercel}"
+    if clean_vercel not in allowed_origins:
+        allowed_origins.append(clean_vercel)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins (including Vercel)
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"^https://.*\.vercel\.app$",
     allow_credentials=True,
-    allow_methods=["*"],  # Allows OPTIONS, POST, GET, etc.
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 

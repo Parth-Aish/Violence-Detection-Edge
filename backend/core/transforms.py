@@ -15,52 +15,64 @@ CHANNELS = 2
 def normalize_pose_skeleton(coords_17x2: np.ndarray) -> np.ndarray:
     """Normalize a single frame's 17 keypoints (17, 2) using mid-hip centering and torso scaling.
 
+    Missing joints (represented as [0.0, 0.0]) are masked so they remain explicitly [0.0, 0.0]
+    and are not shifted by the mid-hip offset into false valid coordinates.
+
     Args:
         coords_17x2: (17, 2) array containing [x, y] coordinates.
 
     Returns:
-        (17, 2) array centered at mid-hip and normalized by torso length.
+        (17, 2) array centered at mid-hip and normalized by torso length for valid joints.
     """
     pts = coords_17x2.astype(np.float32, copy=True)
     if pts.shape != (NUM_NODES, CHANNELS):
         raise ValueError(f"Expected shape (17, 2), got {pts.shape}")
 
-    # Check if frame is empty/zeros
-    if not np.any(pts):
-        return pts
+    # Keypoint validity mask: True for observed joints, False for missing (0, 0)
+    valid_mask = np.any(pts != 0.0, axis=1)
+    if not np.any(valid_mask):
+        return np.zeros_like(pts)
 
-    left_hip = pts[LEFT_HIP]
-    right_hip = pts[RIGHT_HIP]
-    mid_hip = (left_hip + right_hip) * 0.5
+    valid_pts = pts[valid_mask]
 
-    # If hip coordinates are degenerate (0,0), fallback to mean of non-zero points
-    if np.all(mid_hip == 0):
-        valid = pts[np.any(pts != 0, axis=1)]
-        if len(valid) > 0:
-            mid_hip = np.mean(valid, axis=0)
+    # Calculate mid-hip reference using only valid hip joints
+    has_left_hip = bool(valid_mask[LEFT_HIP])
+    has_right_hip = bool(valid_mask[RIGHT_HIP])
+    if has_left_hip and has_right_hip:
+        mid_hip = (pts[LEFT_HIP] + pts[RIGHT_HIP]) * 0.5
+    elif has_left_hip:
+        mid_hip = pts[LEFT_HIP].copy()
+    elif has_right_hip:
+        mid_hip = pts[RIGHT_HIP].copy()
+    else:
+        # Fallback to mean of whatever joints are valid
+        mid_hip = np.mean(valid_pts, axis=0)
 
-    # Root-centering
-    pts_centered = pts - mid_hip
+    # Calculate torso scale using valid shoulder joints
+    has_left_shoulder = bool(valid_mask[LEFT_SHOULDER])
+    has_right_shoulder = bool(valid_mask[RIGHT_SHOULDER])
+    if has_left_shoulder and has_right_shoulder:
+        mid_shoulder = (pts[LEFT_SHOULDER] + pts[RIGHT_SHOULDER]) * 0.5
+        torso_len = float(np.linalg.norm(mid_shoulder - mid_hip))
+    elif has_left_shoulder:
+        torso_len = float(np.linalg.norm(pts[LEFT_SHOULDER] - mid_hip))
+    elif has_right_shoulder:
+        torso_len = float(np.linalg.norm(pts[RIGHT_SHOULDER] - mid_hip))
+    else:
+        torso_len = 0.0
 
-    # Torso scale calculation
-    left_shoulder = pts[LEFT_SHOULDER]
-    right_shoulder = pts[RIGHT_SHOULDER]
-    mid_shoulder = (left_shoulder + right_shoulder) * 0.5
-
-    torso_len = float(np.linalg.norm(mid_shoulder - mid_hip))
-    # Safe scale factor: clamp between 0.05 and 2.0 to prevent explosive coordinates
     if torso_len > 0.01:
         scale = max(torso_len, 0.05)
     else:
-        # Fallback scale based on bounding box extent of valid joints
-        valid_centered = pts_centered[np.any(pts != 0, axis=1)]
-        if len(valid_centered) > 0:
-            box_h = float(np.max(valid_centered[:, 1]) - np.min(valid_centered[:, 1]))
-            scale = max(box_h * 0.5, 0.1)
-        else:
-            scale = 1.0
+        # Fallback scale based on vertical span of valid joints
+        valid_centered = valid_pts - mid_hip
+        box_h = float(np.max(valid_centered[:, 1]) - np.min(valid_centered[:, 1])) if len(valid_centered) > 0 else 1.0
+        scale = max(box_h * 0.5, 0.1)
 
-    return pts_centered / scale
+    # Initialize normalized output as zeros: missing joints remain strictly [0.0, 0.0]
+    out = np.zeros_like(pts)
+    out[valid_mask] = (pts[valid_mask] - mid_hip) / scale
+    return out
 
 
 def normalize_stgcn_sequence(seq_30x17x2: np.ndarray) -> np.ndarray:

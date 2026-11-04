@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import random
 import shutil
 import sys
 from pathlib import Path
+from typing import Optional
 
 # Fix Windows console UTF-8 encoding for PyTorch ONNX export logs
 if sys.platform == "win32":
@@ -158,6 +160,7 @@ def export_stgcn_to_onnx(
 def train_stgcn(
     data_dir: Path,
     output_onnx_path: Path,
+    manifest_path: Optional[Path] = None,
     epochs: int = 25,
     batch_size: int = 32,
     lr: float = 1e-3,
@@ -178,17 +181,81 @@ def train_stgcn(
     y = np.load(labels_path)
     LOGGER.info("Loaded dataset: X=%s, y=%s (Violence: %d, Safe: %d)", X.shape, y.shape, int(np.sum(y == 1)), int(np.sum(y == 0)))
 
-    # Stratified 80/20 train/validation split
-    pos_idx = np.where(y == 1)[0]
-    neg_idx = np.where(y == 0)[0]
-    np.random.shuffle(pos_idx)
-    np.random.shuffle(neg_idx)
+    # Source-Video Aware Train / Validation Split:
+    # 1. Map each sample window in X to its parent video ID
+    if (data_dir / "video_ids.npy").is_file():
+        sample_video_ids = [str(x) for x in np.load(data_dir / "video_ids.npy")]
+    elif (data_dir / "video_ids.json").is_file():
+        with open(data_dir / "video_ids.json", "r", encoding="utf-8") as f:
+            sample_video_ids = json.load(f)
+    else:
+        # Standard mapping for the 2,000 processed samples (1,000 NV + 1,000 V)
+        nv_count = int(np.sum(y == 0))
+        v_count = int(np.sum(y == 1))
+        sample_video_ids = [f"NV_{i+1}.mp4" for i in range(nv_count)] + [f"V_{i+1}.mp4" for i in range(v_count)]
 
-    n_pos_train = int(len(pos_idx) * 0.8)
-    n_neg_train = int(len(neg_idx) * 0.8)
+    # 2. Check for frozen test manifest to enforce zero data leakage across train/val/test
+    chosen_manifest = manifest_path
+    if not chosen_manifest:
+        for candidate in [
+            data_dir / "splits_manifest.json",
+            Path("backend/data/splits_manifest.json"),
+            Path("data/splits_manifest.json"),
+        ]:
+            if candidate.is_file():
+                chosen_manifest = candidate
+                break
 
-    train_idx = np.concatenate([pos_idx[:n_pos_train], neg_idx[:n_neg_train]])
-    val_idx = np.concatenate([pos_idx[n_pos_train:], neg_idx[n_neg_train:]])
+    if chosen_manifest and chosen_manifest.is_file():
+        LOGGER.info("Loading frozen source-video splits from manifest: %s", chosen_manifest)
+        with open(chosen_manifest, "r", encoding="utf-8") as f:
+            manifest_data = json.load(f)
+        train_vids = set(manifest_data.get("train_videos", []))
+        val_vids = set(manifest_data.get("val_videos", []))
+        test_vids = set(manifest_data.get("test_videos", []))
+
+        # Strict zero-leakage assertions
+        assert train_vids.isdisjoint(val_vids), "CRITICAL: Video overlap detected between train and val splits!"
+        assert train_vids.isdisjoint(test_vids), "CRITICAL: Video overlap detected between train and test splits!"
+        assert val_vids.isdisjoint(test_vids), "CRITICAL: Video overlap detected between val and test splits!"
+
+        train_idx = np.array([i for i, vid in enumerate(sample_video_ids) if vid in train_vids], dtype=int)
+        val_idx = np.array([i for i, vid in enumerate(sample_video_ids) if vid in val_vids], dtype=int)
+    else:
+        # Source-video aware split: partition unique video IDs first, never individual sample windows
+        unique_nv = sorted(list(set(vid for i, vid in enumerate(sample_video_ids) if y[i] == 0)))
+        unique_v = sorted(list(set(vid for i, vid in enumerate(sample_video_ids) if y[i] == 1)))
+
+        np.random.seed(42)
+        np.random.shuffle(unique_nv)
+        np.random.shuffle(unique_v)
+
+        train_nv_vids = set(unique_nv[: int(len(unique_nv) * 0.8)])
+        val_nv_vids = set(unique_nv[int(len(unique_nv) * 0.8) :])
+        train_v_vids = set(unique_v[: int(len(unique_v) * 0.8)])
+        val_v_vids = set(unique_v[int(len(unique_v) * 0.8) :])
+
+        train_vids = train_nv_vids | train_v_vids
+        val_vids = val_nv_vids | val_v_vids
+
+        assert train_vids.isdisjoint(val_vids), "CRITICAL: Video overlap detected between train and val splits!"
+
+        train_idx = np.array([i for i, vid in enumerate(sample_video_ids) if vid in train_vids], dtype=int)
+        val_idx = np.array([i for i, vid in enumerate(sample_video_ids) if vid in val_vids], dtype=int)
+
+    # Final verification: verify that no video in train appears in val
+    train_videos_used = set(sample_video_ids[i] for i in train_idx)
+    val_videos_used = set(sample_video_ids[i] for i in val_idx)
+    assert train_videos_used.isdisjoint(val_videos_used), "DATA LEAKAGE DETECTED: Source videos overlap between train and val!"
+
+    LOGGER.info(
+        "Source-Video Aware Split Verified: %d train samples (%d videos), %d val samples (%d videos). Zero data leakage.",
+        len(train_idx),
+        len(train_videos_used),
+        len(val_idx),
+        len(val_videos_used),
+    )
+
     np.random.shuffle(train_idx)
     np.random.shuffle(val_idx)
 
@@ -292,6 +359,12 @@ def main() -> int:
         type=Path,
         default=Path("backend/models/violence_stgcn.onnx"),
     )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Path to frozen splits_manifest.json enforcing zero data leakage",
+    )
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -313,6 +386,7 @@ def main() -> int:
         train_stgcn(
             data_dir=args.data_dir.resolve(),
             output_onnx_path=args.output_onnx.resolve(),
+            manifest_path=args.manifest.resolve() if args.manifest else None,
             epochs=args.epochs,
             batch_size=args.batch_size,
             lr=args.lr,

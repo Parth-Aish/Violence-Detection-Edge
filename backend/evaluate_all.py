@@ -50,6 +50,77 @@ class VideoEvaluationResult:
     fps: float
 
 
+def collect_manifest_files(
+    root_dir: Path,
+    manifest_path: Path,
+    split: str = "test",
+    limit_per_class: Optional[int] = None,
+) -> tuple[list[tuple[Path, str]], dict[str, Any]]:
+    """Load video files from a frozen manifest and rigorously verify zero data leakage."""
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Splits manifest not found at {manifest_path}")
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    train_set = set(manifest.get("train_videos", []))
+    val_set = set(manifest.get("val_videos", []))
+    test_set = set(manifest.get("test_videos", []))
+
+    # Audit verification: test set must be strictly disjoint from train and val sets
+    train_overlap = test_set & train_set
+    val_overlap = test_set & val_set
+    if train_overlap:
+        raise ValueError(
+            f"DATA LEAKAGE DETECTED: {len(train_overlap)} test videos found in training set! E.g. {list(train_overlap)[:3]}"
+        )
+    if val_overlap:
+        raise ValueError(
+            f"DATA LEAKAGE DETECTED: {len(val_overlap)} test videos found in validation set! E.g. {list(val_overlap)[:3]}"
+        )
+
+    print("[AUDIT PASSED] Zero Data Leakage: Verified 0 test videos appear in train or validation sets.")
+
+    target_video_names = manifest.get(f"{split}_videos", [])
+    if not target_video_names:
+        raise ValueError(f"No videos found for split '{split}' in manifest {manifest_path}")
+
+    v_dir = root_dir / "data" / "raw" / "Violence"
+    nv_dir = root_dir / "data" / "raw" / "NonViolence"
+
+    v_files: list[Path] = []
+    nv_files: list[Path] = []
+
+    for name in target_video_names:
+        if name.startswith("V_"):
+            p = v_dir / name
+            if p.is_file():
+                v_files.append(p)
+        elif name.startswith("NV_"):
+            p = nv_dir / name
+            if p.is_file():
+                nv_files.append(p)
+
+    v_files.sort(key=natural_sort_key)
+    nv_files.sort(key=natural_sort_key)
+
+    if limit_per_class and limit_per_class > 0:
+        v_files = v_files[:limit_per_class]
+        nv_files = nv_files[:limit_per_class]
+
+    dataset = [(f, "Violence") for f in v_files] + [(f, "Safe") for f in nv_files]
+    audit_meta = {
+        "manifest_path": str(manifest_path),
+        "split": split,
+        "train_count": len(train_set),
+        "val_count": len(val_set),
+        "test_count": len(test_set),
+        "evaluated_count": len(dataset),
+        "zero_leakage_verified": True,
+    }
+    return dataset, audit_meta
+
+
 def collect_dataset_files(
     root_dir: Path,
     limit_per_class: Optional[int] = None,
@@ -189,6 +260,7 @@ def run_evaluation(
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
     overall_throughput_fps = total_frames / total_processing_sec if total_processing_sec > 0 else 0.0
 
     print("\n" + "=" * 80)
@@ -208,9 +280,10 @@ def run_evaluation(
     print(f"  Total                     {tn + fn:5d}               {fp + tp:5d}            {total_evaluated:5d}")
     print("-" * 80)
     print(f"  Accuracy:                 {accuracy * 100:6.2f}%   ({tp + tn}/{total_evaluated})")
+    print(f"  False Positive Rate (FPR):{fpr * 100:6.2f}%   ({fp}/{fp + tn})")
     print(f"  Precision:                {precision * 100:6.2f}%   ({tp}/{tp + fp})")
     print(f"  Recall (Sensitivity):     {recall * 100:6.2f}%   ({tp}/{tp + fn})")
-    print(f"  Specificity:              {specificity * 100:6.2f}%   ({tn}/{tn + fp})")
+    print(f"  Specificity (TNR):        {specificity * 100:6.2f}%   ({tn}/{tn + fp})")
     print(f"  F1 Score:                 {f1:8.4f}")
     print("=" * 80)
 
@@ -240,6 +313,7 @@ def run_evaluation(
         },
         "metrics": {
             "accuracy": round(accuracy, 4),
+            "false_positive_rate": round(fpr, 4),
             "precision": round(precision, 4),
             "recall": round(recall, 4),
             "specificity": round(specificity, 4),
@@ -263,7 +337,25 @@ def run_evaluation(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Dataset-Wide Evaluation & Kinematic Performance Reporting"
+        description="Strict Holdout Evaluation & Kinematic Performance Reporting"
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Path to frozen splits_manifest.json for strict zero-leakage holdout evaluation.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="test",
+        choices=["test", "val", "train"],
+        help="Split to evaluate when using manifest (default: 'test').",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Evaluate all raw videos across data/raw directories instead of strict holdout.",
     )
     parser.add_argument(
         "--limit",
@@ -292,7 +384,29 @@ def main() -> int:
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
-    dataset = collect_dataset_files(project_root, limit_per_class=args.limit)
+
+    # Locate manifest if not specified
+    manifest_path = args.manifest
+    if not manifest_path and not args.all:
+        for candidate in [
+            project_root / "backend" / "data" / "splits_manifest.json",
+            project_root / "data" / "splits_manifest.json",
+        ]:
+            if candidate.is_file():
+                manifest_path = candidate
+                break
+
+    if manifest_path and not args.all:
+        print(f"\n[EVALUATION MODE] Strict Holdout Split: '{args.split}' from manifest: {manifest_path}")
+        dataset, audit_meta = collect_manifest_files(
+            root_dir=project_root,
+            manifest_path=manifest_path,
+            split=args.split,
+            limit_per_class=args.limit,
+        )
+    else:
+        print("\n[EVALUATION MODE] Full Dataset Directory Glob (All Raw Videos)")
+        dataset = collect_dataset_files(project_root, limit_per_class=args.limit)
 
     run_evaluation(
         dataset=dataset,
