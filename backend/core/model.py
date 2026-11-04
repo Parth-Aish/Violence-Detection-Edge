@@ -6,14 +6,23 @@ combined with 1D temporal convolutions across 30-frame sequences.
 
 from __future__ import annotations
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    HAS_TORCH = True
+except (ImportError, ModuleNotFoundError):
+    torch = None  # type: ignore
+    nn = None  # type: ignore
+    F = None  # type: ignore
+    HAS_TORCH = False
+
+_BaseModule = nn.Module if HAS_TORCH else object
 
 from .graph import NUM_NODES, get_coco_normalized_adjacency
 
 
-class SpatialGraphConv(nn.Module):
+class SpatialGraphConv(_BaseModule):
     """Spatial Graph Convolution: X_out = Conv2d(X * A_norm, kernel_size=(1, 1)).
 
     Input:  (B, C_in, T, V)
@@ -35,7 +44,7 @@ class SpatialGraphConv(nn.Module):
         return self.conv(x_g)
 
 
-class STGCNBlock(nn.Module):
+class STGCNBlock(_BaseModule):
     """Single ST-GCN block fusing spatial graph convolution and temporal 1D convolution."""
 
     def __init__(
@@ -89,7 +98,7 @@ class STGCNBlock(nn.Module):
         return self.dropout(x)
 
 
-class STGCN(nn.Module):
+class STGCN(_BaseModule):
     """Complete Spatial-Temporal Graph Convolutional Network for Violence Detection.
 
     Input shape:  (Batch, 2, 30, 17)

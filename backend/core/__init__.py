@@ -14,16 +14,12 @@ from .inference import (
     compute_bbox_iou,
     compute_relational_strike_distance,
 )
-from .model import STGCN, STGCNBlock, SpatialGraphConv
 from .transforms import normalize_stgcn_sequence, raw_to_stgcn_tensor
 
 __all__ = [
     "COCOGraph",
     "COCO_EDGES",
     "COCO_KEYPOINTS",
-    "STGCN",
-    "STGCNBlock",
-    "SpatialGraphConv",
     "raw_to_stgcn_tensor",
     "normalize_stgcn_sequence",
     "PoseSTGCNDetector",
