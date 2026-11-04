@@ -18,6 +18,8 @@ env/
 *.onnx
 !backend/violence_lstm.onnx
 !backend/yolov8n-pose.onnx
+!backend/models/violence_stgcn.onnx
+!backend/violence_stgcn.onnx
 *.engine
 runs/
 
