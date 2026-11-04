@@ -13,7 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from inference import ViolencePrediction
+try:
+    from core.inference import Severity, ViolencePrediction
+except ImportError:
+    from inference import Severity, ViolencePrediction
 
 logger = logging.getLogger("incident_logger")
 DATA_DIR = Path(__file__).parent / "data"
@@ -52,10 +55,18 @@ class IncidentLogger:
                         fps REAL NOT NULL,
                         inference_ms REAL NOT NULL,
                         confidence REAL NOT NULL,
-                        bbox_json TEXT
+                        bbox_json TEXT,
+                        video_source TEXT,
+                        incident_timestamps_json TEXT,
+                        details TEXT
                     )
                     """
                 )
+                for col_name in ["video_source", "incident_timestamps_json", "details"]:
+                    try:
+                        connection.execute(f"ALTER TABLE violence_events ADD COLUMN {col_name} TEXT")
+                    except sqlite3.OperationalError:
+                        pass
                 connection.execute(
                     "CREATE INDEX IF NOT EXISTS idx_violence_events_timestamp "
                     "ON violence_events(timestamp DESC)"
@@ -67,7 +78,12 @@ class IncidentLogger:
         )
 
     @staticmethod
-    def _record(prediction: ViolencePrediction) -> dict:
+    def _record(
+        prediction: ViolencePrediction,
+        video_source: Optional[str] = None,
+        incident_timestamps: Optional[list[float]] = None,
+        details: Optional[str] = None,
+    ) -> dict:
         timestamp = prediction.timestamp
         return {
             "id": str(uuid.uuid4()),
@@ -83,9 +99,18 @@ class IncidentLogger:
             "inference_ms": round(prediction.inference_ms, 3),
             "confidence": round(prediction.confidence, 4),
             "bbox": list(prediction.bbox) if prediction.bbox else None,
+            "video_source": video_source,
+            "incident_timestamps": incident_timestamps or [],
+            "details": details or "",
         }
 
-    def log_prediction(self, prediction: ViolencePrediction) -> Optional[dict]:
+    def log_prediction(
+        self,
+        prediction: ViolencePrediction,
+        video_source: Optional[str] = None,
+        incident_timestamps: Optional[list[float]] = None,
+        details: Optional[str] = None,
+    ) -> Optional[dict]:
         """Write a positive prediction unless it falls inside the cooldown."""
         if not prediction.is_fighting:
             return None
@@ -93,15 +118,21 @@ class IncidentLogger:
         with self._lock:
             if prediction.timestamp - self._last_logged_at < self.cooldown_seconds:
                 return None
-            record = self._record(prediction)
+            record = self._record(
+                prediction,
+                video_source=video_source,
+                incident_timestamps=incident_timestamps,
+                details=details,
+            )
             with closing(sqlite3.connect(self.db_path, timeout=10)) as connection:
                 with connection:
                     connection.execute(
                         """
                         INSERT INTO violence_events (
                             id, timestamp, timestamp_iso, is_violence, probability,
-                            severity, severity_label, fps, inference_ms, confidence, bbox_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            severity, severity_label, fps, inference_ms, confidence, bbox_json,
+                            video_source, incident_timestamps_json, details
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             record["id"],
@@ -115,6 +146,9 @@ class IncidentLogger:
                             record["inference_ms"],
                             record["confidence"],
                             json.dumps(record["bbox"]),
+                            record["video_source"],
+                            json.dumps(record["incident_timestamps"]),
+                            record["details"],
                         ),
                     )
             try:
@@ -126,11 +160,12 @@ class IncidentLogger:
 
             self._last_logged_at = prediction.timestamp
             logger.warning(
-                "Violence incident logged: %s probability=%.3f fps=%.2f latency=%.2fms",
+                "Violence incident logged: %s probability=%.3f fps=%.2f latency=%.2fms source=%s",
                 record["severity_label"],
                 record["probability"],
                 record["fps"],
                 record["inference_ms"],
+                record["video_source"] or "live",
             )
             return record
 
@@ -154,14 +189,20 @@ class IncidentLogger:
             inference_ms=0.0,
             fps=30.0,
         )
-        return self.log_prediction(pred)
+        return self.log_prediction(
+            pred,
+            video_source=video_source,
+            incident_timestamps=incident_timestamps or [],
+            details=details,
+        )
 
     def get_recent_incidents(
         self, limit: int = 50, since_timestamp: Optional[float] = None
     ) -> list[dict]:
         query = (
             "SELECT id, timestamp, timestamp_iso, is_violence, probability, "
-            "severity, severity_label, fps, inference_ms, confidence, bbox_json "
+            "severity, severity_label, fps, inference_ms, confidence, bbox_json, "
+            "video_source, incident_timestamps_json, details "
             "FROM violence_events"
         )
         parameters: list[float | int] = []
@@ -179,6 +220,7 @@ class IncidentLogger:
             record = dict(row)
             record["is_violence"] = bool(record["is_violence"])
             record["bbox"] = json.loads(record.pop("bbox_json") or "null")
+            record["incident_timestamps"] = json.loads(record.pop("incident_timestamps_json") or "[]")
             records.append(record)
         return records
 

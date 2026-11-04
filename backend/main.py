@@ -109,14 +109,21 @@ core.scene_gating.SceneClassifier = LightweightCloudSceneClassifier
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global _classifier, _incident_logger
-    log.info("Initializing Lightweight Cloud Pose + ST-GCN Batch Inference Service (512MB RAM Profile)...")
+    env_stride = max(1, int(os.getenv("POSE_STRIDE", str(POSE_STRIDE))))
+    env_threshold = float(os.getenv("VIOLENCE_THRESHOLD", "0.65"))
+    log.info(
+        "Initializing Cloud Pose + ST-GCN Batch Inference Service (stride=%d, threshold=%.2f)...",
+        env_stride,
+        env_threshold,
+    )
     _classifier = PoseSTGCNDetector(
         intra_op_threads=1,
-        pose_stride=3,
+        pose_stride=env_stride,
+        threshold=env_threshold,
         enable_scene_gating=False,
     )
     _incident_logger = IncidentLogger()
-    log.info("Lightweight Cloud Model loaded successfully (threads=1, stride=3, scene_gating=DISABLED). Ready for batch analysis.")
+    log.info("Cloud Model loaded successfully (stride=%d, threshold=%.2f, scene_gating=DISABLED). Ready for batch analysis.", env_stride, env_threshold)
     try:
         yield
     finally:
@@ -239,14 +246,65 @@ class AnalyzeRequest(BaseModel):
     sample_name: Optional[str] = None
 
 
+# ─── API Security: Throttling & Input Validation ─────────────────────────────
+_rate_limit_lock = asyncio.Lock()
+_ip_request_history: dict[str, list[float]] = {}
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "30"))
+RATE_LIMIT_WINDOW_SEC = float(os.getenv("RATE_LIMIT_WINDOW_SEC", "60.0"))
+
+
+async def check_rate_limit(request: Request) -> None:
+    """Enforce per-IP request throttling on resource-intensive endpoints."""
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    async with _rate_limit_lock:
+        timestamps = _ip_request_history.setdefault(client_ip, [])
+        cutoff = now - RATE_LIMIT_WINDOW_SEC
+        _ip_request_history[client_ip] = [t for t in timestamps if t > cutoff]
+        if len(_ip_request_history[client_ip]) >= RATE_LIMIT_MAX_REQUESTS:
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded: too many analysis requests. Please try again later.",
+            )
+        _ip_request_history[client_ip].append(now)
+
+
+def validate_video_file(first_bytes: bytes, content_type: Optional[str] = None) -> bool:
+    """Validate binary magic signatures to verify video authenticity."""
+    if len(first_bytes) < 8:
+        return False
+    # MP4 / MOV: 'ftyp' magic signature
+    if first_bytes[4:8] == b"ftyp" or b"ftyp" in first_bytes[:32]:
+        return True
+    # AVI: starts with RIFF and has AVI 
+    if first_bytes[:4] == b"RIFF" and len(first_bytes) >= 12 and first_bytes[8:12] == b"AVI ":
+        return True
+    # Matroska / WebM: starts with EBML ID 0x1A45DFA3
+    if first_bytes[:4] == b"\x1a\x45\xdf\xa3":
+        return True
+    # ISO Base Media container atoms
+    if first_bytes[4:8] in {b"moov", b"mdat", b"wide", b"free", b"skip"}:
+        return True
+    if content_type and content_type.lower() in {
+        "video/mp4",
+        "video/x-matroska",
+        "video/quicktime",
+        "video/x-msvideo",
+        "video/avi",
+    }:
+        return True
+    return False
+
+
 @app.post("/api/analyze_video")
 @app.post("/analyze_video")
 async def analyze_video_endpoint(
+    request: Request,
     file: Optional[UploadFile] = File(None),
     sample_name: Optional[str] = Form(None),
     sample_query: Optional[str] = Query(None, alias="sample"),
 ) -> dict[str, Any]:
-    """Process an entire video clip sequentially using Pose + LSTM kinematics.
+    """Process an entire video clip sequentially using Pose + ST-GCN kinematics.
 
     Accepts an uploaded .mp4 file or a sample name from data/raw or frontend/public/samples.
     Returns:
@@ -262,6 +320,8 @@ async def analyze_video_endpoint(
         "timeline": [...]
     }
     """
+    await check_rate_limit(request)
+
     if _classifier is None:
         raise HTTPException(status_code=503, detail="Inference model is not loaded yet.")
 
@@ -285,7 +345,19 @@ async def analyze_video_endpoint(
         )
         temp_path = Path(temp_dest.name)
         try:
-            total_bytes = 0
+            first_chunk = await file.read(1024 * 1024)
+            if not first_chunk:
+                raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+            if not validate_video_file(first_chunk[:64], file.content_type):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid video content: file header does not match a supported video container format.",
+                )
+
+            total_bytes = len(first_chunk)
+            temp_dest.write(first_chunk)
+
             while chunk := await file.read(1024 * 1024):
                 total_bytes += len(chunk)
                 if total_bytes > MAX_UPLOAD_BYTES:
@@ -296,9 +368,6 @@ async def analyze_video_endpoint(
                 temp_dest.write(chunk)
             temp_dest.flush()
             temp_dest.close()
-
-            if total_bytes == 0:
-                raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
             target_video_path = temp_path
             is_temporary_file = True
@@ -346,10 +415,13 @@ async def analyze_video_endpoint(
 
         return report
 
+    except HTTPException:
+        raise
     except Exception as exc:
         log.exception("Error processing video %s: %s", target_video_path, exc)
         raise HTTPException(
-            status_code=500, detail=f"Analysis pipeline error: {str(exc)}"
+            status_code=500,
+            detail="Internal Server Error: video analysis failed. Please verify the input file format and try again.",
         )
     finally:
         if is_temporary_file and target_video_path is not None:

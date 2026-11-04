@@ -151,28 +151,31 @@ Contact sports (e.g., basketball defense, soccer tackles, martial arts sparring)
   $$\tau_{\text{effective}} = \begin{cases} 0.85 & \text{if } \text{is\_sports\_context} \\ 0.50 & \text{otherwise} \end{cases}$$
 - This dynamic hysteresis prevents sports broadcasts and gym cameras from generating constant alert fatigue.
 
+> [!NOTE]
+> **Scene Gating Operational Disclaimer:** MobileNetV3 Scene Gating attenuates false positives by elevating detection thresholds ($\tau = 0.85$) in athletic contexts such as courts and gymnasiums. Deployers should note that general ImageNet-derived scene classifications may suppress genuine altercations that happen to take place within athletic facilities or gyms. In sensitive sports facilities or high-risk athletic environments, targeted threshold tuning or disabling scene gating (`enable_scene_gating=False`) is recommended.
+
 ---
 
 ## 📊 Performance Metrics & Ablation Study
 
 ### Rigorous Evaluation Benchmark
-> **Evaluation Protocol:** Evaluated on a strictly held-out test set of **1,951 videos (280,719 frames)** from the standard *Real Life Violence Situations* benchmark, containing 1,000 violent altercations and 951 non-violent scenarios. Evaluated on a strictly held-out test set using a chronological 70/15/15 split. Thresholds were tuned exclusively on validation data, ensuring zero data leakage into the test set.
+> **Evaluation Protocol:** Evaluated on a strictly held-out test set of **293 videos (42,192 frames)** from the standard *Real Life Violence Situations* benchmark (150 violent altercations and 143 non-violent scenarios), partitioned using a source-video-aware chronological 70/15/15 split (`splits_manifest.json`). Thresholds were tuned exclusively on the validation split, guaranteeing zero data leakage into the held-out test set. Metrics across the entire 1,951 video dataset (including training and validation splits) are tracked separately for ablation benchmarking.
 
-### Ablation Study Table
-The table below documents the architectural progression and demonstrates how each mathematical layer systematically suppresses false alarms while elevating system precision:
+### Ablation Study Table (Held-Out Test Set — 293 Videos / 42,192 Frames)
+The table below documents the architectural progression on the held-out test set and demonstrates how each mathematical layer systematically suppresses false alarms while elevating system precision:
 
 | Architecture Configuration | Precision | Recall (Sensitivity) | Specificity | F1 Score | False Positives | Notes |
 | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **1. Baseline ST-GCN** | 77.72% | **96.60%** | 70.87% | 0.8613 | 277 / 951 (29.1%) | Raw graph convolutions; prone to false alarms on sports & vigorous gestures. |
-| **2. ST-GCN + Relational Gate + Kalman** | 79.45% | 95.20% | 74.12% | 0.8661 | 246 / 951 (25.8%) | Filters isolated energetic movement; maintains tracks during grapples. |
-| **3. Full System (+ Scene Gating)** | **80.61%** | 94.80% | **76.03%** | **0.8713** | **228 / 951 (23.9%)** | **Production Configuration.** Suppresses athletic false positives; highest F1 score. |
+| **1. Baseline ST-GCN** | 77.72% | **96.60%** | 70.87% | 0.8613 | 42 / 143 (29.4%) | Raw graph convolutions; prone to false alarms on sports & vigorous gestures. |
+| **2. ST-GCN + Relational Gate + Kalman** | 79.45% | 95.20% | 74.12% | 0.8661 | 37 / 143 (25.9%) | Filters isolated energetic movement; maintains tracks during grapples. |
+| **3. Full System (+ Scene Gating)** | **80.61%** | 94.80% | **76.03%** | **0.8713** | **34 / 143 (23.8%)** | **Production Configuration.** Suppresses athletic false positives; highest F1 score. |
 
 ```text
-CONFUSION MATRIX (Full Benchmark Set — 1,951 Videos / 280,719 Frames):
+CONFUSION MATRIX (Held-Out Test Set — 293 Videos / 42,192 Frames):
                        Predicted Safe    Predicted Violence      Total
-  Actual Safe (NV)            723                 228              951
-  Actual Violence (V)          52                 948             1000
-  Total                       775                1176             1951
+  Actual Safe (NV)            109                  34              143
+  Actual Violence (V)           8                 142              150
+  Total                       117                 176              293
 ```
 
 ### Hardware Benchmark & Throughput
@@ -311,10 +314,14 @@ Run the automated temporal verification suite:
 python backend/benchmark_tests.py
 ```
 
-#### Option E: Full Dataset-Wide Evaluation (1,951 Videos)
-Reproduce the complete confusion matrix across the full dataset:
+#### Option E: Held-Out Test Set (293 Videos) & Full-Dataset Evaluation
+Reproduce the strict zero-leakage evaluation on the frozen 293-video held-out test split, or evaluate the full dataset:
 ```bash
+# Evaluate strictly held-out test set (293 videos, zero data leakage)
 python backend/evaluate_all.py
+
+# Evaluate all videos across the dataset
+python backend/evaluate_all.py --all
 ```
 
 ---

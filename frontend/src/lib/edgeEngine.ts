@@ -32,6 +32,7 @@ import {
   BBox,
   TrackedPerson,
   normalizePoseSequence,
+  rawToStgcnTensor,
   extractKinematicTensor,
   biomechanicalScore,
   computeInteractionTurbulence,
@@ -72,7 +73,7 @@ export interface LoadProgress { stage: string }
 // ─── EdgeEngine ───────────────────────────────────────────────────────────────
 export class EdgeEngine {
   private poseSession: ort.InferenceSession | null = null;
-  private lstmSession: ort.InferenceSession | null = null;
+  private stgcnSession: ort.InferenceSession | null = null;
   private _backend = "—";
   private _state: EngineState = "idle";
 
@@ -118,9 +119,9 @@ export class EdgeEngine {
         graphOptimizationLevel: "all",
       };
 
-      [this.poseSession, this.lstmSession] = await Promise.all([
+      [this.poseSession, this.stgcnSession] = await Promise.all([
         ort.InferenceSession.create("/models/yolov8n-pose.onnx", opts),
-        ort.InferenceSession.create("/models/violence_lstm_v2.onnx", opts),
+        ort.InferenceSession.create("/models/violence_stgcn.onnx", opts),
       ]);
 
       this._backend = "WASM";
@@ -150,7 +151,7 @@ export class EdgeEngine {
 
   // ─── Main inference entry ───────────────────────────────────────────────────
   async processFrame(frameData: ImageData): Promise<EdgePrediction> {
-    if (!this.poseSession || !this.lstmSession) {
+    if (!this.poseSession || !this.stgcnSession) {
       throw new Error("EdgeEngine not loaded");
     }
     const t0 = performance.now();
@@ -356,9 +357,9 @@ export class EdgeEngine {
     return nms(primary, POSE_NMS_THRESHOLD).slice(0, 4);
   }
 
-  // ─── LSTM probability (port of _track_probability) ──────────────────────────
+  // ─── ST-GCN probability (port of PoseSTGCNDetector._track_probability) ───
   private async _trackProbability(track: TrackedPerson): Promise<number> {
-    if (!this.lstmSession || track.history.length < 6) return 0;
+    if (!this.stgcnSession || track.history.length < 6) return 0;
 
     let sequence = [...track.history];
     if (sequence.length < SEQUENCE_LENGTH) {
@@ -367,19 +368,25 @@ export class EdgeEngine {
     }
     const last30 = sequence.slice(-SEQUENCE_LENGTH);
 
-    // Flatten to [30, 34] Float32Array
-    const raw = new Float32Array(SEQUENCE_LENGTH * RAW_FEATURE_COUNT);
-    for (let t = 0; t < SEQUENCE_LENGTH; t++) raw.set(last30[t], t * RAW_FEATURE_COUNT);
-
-    // extractKinematicTensor -> (30, 82)
-    const kinematic = extractKinematicTensor(raw);
-    const inputTensor = new ort.Tensor("float32", kinematic, [1, SEQUENCE_LENGTH, KINEMATIC_FEATURE_COUNT]);
+    // Transform into (1, 2, 30, 17) ST-GCN tensor
+    const stgcnData = rawToStgcnTensor(last30);
+    const inputTensor = new ort.Tensor("float32", stgcnData, [1, 2, SEQUENCE_LENGTH, KEYPOINT_COUNT]);
     const feeds: Record<string, ort.Tensor> = {};
-    feeds[this.lstmSession.inputNames[0]] = inputTensor;
-    const out = await this.lstmSession.run(feeds);
-    const outData = out[this.lstmSession.outputNames[0]].data as Float32Array;
-    const p = outData.length > 1 ? outData[1] : outData[0];
-    return Math.max(0, Math.min(1, isFinite(p) ? p : 0));
+    feeds[this.stgcnSession.inputNames[0]] = inputTensor;
+    const out = await this.stgcnSession.run(feeds);
+    const outData = out[this.stgcnSession.outputNames[0]].data as Float32Array;
+    const rawVal = outData[0] ?? 0;
+
+    // Calibrate raw logit / output matching backend/core/inference.py
+    let logit = rawVal;
+    if (rawVal >= 0 && rawVal <= 1) {
+      const eps = 1e-6;
+      const valC = Math.max(eps, Math.min(1 - eps, rawVal));
+      logit = Math.log(valC / (1 - valC));
+    }
+    const calLogit = Math.max(-15, Math.min(15, logit + 0.55));
+    const prob = 1 / (1 + Math.exp(-calLogit));
+    return Math.max(0, Math.min(1, isFinite(prob) ? prob : 0));
   }
 }
 

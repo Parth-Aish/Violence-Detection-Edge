@@ -181,7 +181,8 @@ async function runClientSideEdgeInference(
     }
   }
 
-  const isViolent = incidentTimestamps.length > 0 || peakProb >= 0.65;
+  // Verdict matches backend exactly: violent if and only if sustained temporal incident triggered
+  const isViolent = incidentTimestamps.length > 0;
   const processingTime = Number(((performance.now() - tStart) / 1000).toFixed(2));
 
   return {

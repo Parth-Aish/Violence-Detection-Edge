@@ -188,11 +188,18 @@ def train_stgcn(
     elif (data_dir / "video_ids.json").is_file():
         with open(data_dir / "video_ids.json", "r", encoding="utf-8") as f:
             sample_video_ids = json.load(f)
+    elif (Path("backend/data/video_ids.json")).is_file():
+        with open(Path("backend/data/video_ids.json"), "r", encoding="utf-8") as f:
+            sample_video_ids = json.load(f)
+    elif (Path("data/processed/video_ids.json")).is_file():
+        with open(Path("data/processed/video_ids.json"), "r", encoding="utf-8") as f:
+            sample_video_ids = json.load(f)
     else:
-        # Standard mapping for the 2,000 processed samples (1,000 NV + 1,000 V)
-        nv_count = int(np.sum(y == 0))
-        v_count = int(np.sum(y == 1))
-        sample_video_ids = [f"NV_{i+1}.mp4" for i in range(nv_count)] + [f"V_{i+1}.mp4" for i in range(v_count)]
+        raise FileNotFoundError(
+            "CRITICAL: video_ids.json is missing. Please run backend/prepare_dataset.py "
+            "to generate deterministic video ID mappings before training. "
+            "Silent fallback video ID generation is prohibited to prevent data leakage."
+        )
 
     # 2. Check for frozen test manifest to enforce zero data leakage across train/val/test
     chosen_manifest = manifest_path

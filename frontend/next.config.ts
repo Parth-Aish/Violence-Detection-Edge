@@ -12,7 +12,6 @@ function syncOnnxWasmBinaries(): void {
   try {
     const ortDist = path.resolve(process.cwd(), "node_modules", "onnxruntime-web", "dist");
     const publicWasmDir = path.resolve(process.cwd(), "public", "ort-wasm");
-    const publicDir = path.resolve(process.cwd(), "public");
 
     if (fs.existsSync(ortDist)) {
       if (!fs.existsSync(publicWasmDir)) {
@@ -26,12 +25,6 @@ function syncOnnxWasmBinaries(): void {
           if (!fs.existsSync(dest) || fs.statSync(src).size !== fs.statSync(dest).size) {
             fs.copyFileSync(src, dest);
           }
-          if (file.endsWith(".wasm")) {
-            const rootDest = path.join(publicDir, file);
-            if (!fs.existsSync(rootDest) || fs.statSync(src).size !== fs.statSync(rootDest).size) {
-              fs.copyFileSync(src, rootDest);
-            }
-          }
         }
       }
     }
@@ -42,8 +35,23 @@ function syncOnnxWasmBinaries(): void {
 
 syncOnnxWasmBinaries();
 
+const isDev = process.env.NODE_ENV === "development";
+
 const nextConfig: NextConfig = {
-  output: "export",
+  ...(isDev
+    ? {
+        async rewrites() {
+          return [
+            {
+              source: "/api/:path*",
+              destination: "http://127.0.0.1:8000/api/:path*",
+            },
+          ];
+        },
+      }
+    : {
+        output: "export",
+      }),
 
   turbopack: {
     rules: {

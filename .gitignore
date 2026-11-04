@@ -21,6 +21,9 @@ env/
 !backend/models/violence_stgcn.onnx.data
 !backend/violence_stgcn.onnx
 !backend/violence_stgcn.onnx.data
+!frontend/public/models/yolov8n-pose.onnx
+!frontend/public/models/violence_stgcn.onnx
+!frontend/public/models/violence_stgcn.onnx.data
 *.engine
 runs/
 

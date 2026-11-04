@@ -729,3 +729,108 @@ export function updateTracks(
 }
 
 export function resetTrackIdCounter(): void { nextTrackId = 1; }
+
+/**
+ * Normalize a single frame's 17 keypoints (17, 2) matching backend/core/transforms.py
+ * using mid-hip centering and torso scaling. Missing joints ([0, 0]) remain explicitly [0, 0].
+ */
+export function normalizePoseSkeleton(coords: Float32Array | number[]): Float32Array {
+  const out = new Float32Array(34);
+  const pts: [number, number][] = [];
+  const valid: boolean[] = [];
+
+  for (let k = 0; k < 17; k++) {
+    const x = coords[k * 2] ?? 0;
+    const y = coords[k * 2 + 1] ?? 0;
+    pts.push([x, y]);
+    valid.push(x !== 0 || y !== 0);
+  }
+
+  const hasAny = valid.some((v) => v);
+  if (!hasAny) return out;
+
+  // Mid-hip calculation matching transforms.py
+  let midHipX = 0, midHipY = 0;
+  if (valid[11] && valid[12]) {
+    midHipX = (pts[11][0] + pts[12][0]) * 0.5;
+    midHipY = (pts[11][1] + pts[12][1]) * 0.5;
+  } else if (valid[11]) {
+    midHipX = pts[11][0];
+    midHipY = pts[11][1];
+  } else if (valid[12]) {
+    midHipX = pts[12][0];
+    midHipY = pts[12][1];
+  } else {
+    let sx = 0, sy = 0, count = 0;
+    for (let k = 0; k < 17; k++) {
+      if (valid[k]) {
+        sx += pts[k][0];
+        sy += pts[k][1];
+        count++;
+      }
+    }
+    midHipX = sx / Math.max(count, 1);
+    midHipY = sy / Math.max(count, 1);
+  }
+
+  // Torso scale calculation matching transforms.py
+  let torsoLen = 0;
+  if (valid[5] && valid[6]) {
+    const midSx = (pts[5][0] + pts[6][0]) * 0.5;
+    const midSy = (pts[5][1] + pts[6][1]) * 0.5;
+    torsoLen = Math.hypot(midSx - midHipX, midSy - midHipY);
+  } else if (valid[5]) {
+    torsoLen = Math.hypot(pts[5][0] - midHipX, pts[5][1] - midHipY);
+  } else if (valid[6]) {
+    torsoLen = Math.hypot(pts[6][0] - midHipX, pts[6][1] - midHipY);
+  }
+
+  let scale = 1.0;
+  if (torsoLen > 0.01) {
+    scale = Math.max(torsoLen, 0.05);
+  } else {
+    let minY = Infinity, maxY = -Infinity;
+    for (let k = 0; k < 17; k++) {
+      if (valid[k]) {
+        const vy = pts[k][1] - midHipY;
+        if (vy < minY) minY = vy;
+        if (vy > maxY) maxY = vy;
+      }
+    }
+    const boxH = maxY > minY ? maxY - minY : 1.0;
+    scale = Math.max(boxH * 0.5, 0.1);
+  }
+
+  for (let k = 0; k < 17; k++) {
+    if (valid[k]) {
+      out[k * 2] = (pts[k][0] - midHipX) / scale;
+      out[k * 2 + 1] = (pts[k][1] - midHipY) / scale;
+    } else {
+      out[k * 2] = 0;
+      out[k * 2 + 1] = 0;
+    }
+  }
+  return out;
+}
+
+/**
+ * Transforms a sequence of 30 frames (each 34 floats) into an ST-GCN input tensor of shape (1, 2, 30, 17)
+ * Transpose: (1, T=30, V=17, C=2) -> (1, C=2, T=30, V=17) matching raw_to_stgcn_tensor in transforms.py.
+ */
+export function rawToStgcnTensor(sequence: Float32Array[]): Float32Array {
+  // shape: [1, C=2, T=30, V=17] -> 2 * 30 * 17 = 1020 floats
+  const tensor = new Float32Array(2 * 30 * 17);
+  for (let t = 0; t < 30; t++) {
+    const raw = sequence[t] || new Float32Array(34);
+    const norm = normalizePoseSkeleton(raw);
+    for (let v = 0; v < 17; v++) {
+      const x = norm[v * 2];
+      const y = norm[v * 2 + 1];
+      // channel 0 (x): offset = 0 * 510 + t * 17 + v
+      tensor[0 * 510 + t * 17 + v] = x;
+      // channel 1 (y): offset = 1 * 510 + t * 17 + v
+      tensor[1 * 510 + t * 17 + v] = y;
+    }
+  }
+  return tensor;
+}
