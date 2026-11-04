@@ -27,7 +27,8 @@ import {
 } from "lucide-react";
 
 // ─── API Config ─────────────────────────────────────────────────────────────
-const RAW_API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+const RAW_API_URL =
+  process.env.NEXT_PUBLIC_API_URL || "https://violence-detection-edge.onrender.com";
 const API_URL = RAW_API_URL.replace(/\/+$/, "");
 
 // ─── Data Types ─────────────────────────────────────────────────────────────
