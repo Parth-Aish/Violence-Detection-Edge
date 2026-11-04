@@ -148,17 +148,50 @@ export default function AppleGradeVisionDashboard() {
     return () => clearInterval(timer);
   }, [isAnalyzing]);
 
-  // Handle sample selection
-  const handleSelectSample = (sample: SampleItem) => {
-    setSelectedSample(sample);
-    setUploadedFile(null);
-    setPreviewVideoUrl(sample.videoUrl);
+  // Core video file processor (shared by drag-and-drop, file upload, and sample fetching)
+  const processVideoFile = (file: File, sampleMeta: SampleItem | null = null) => {
+    setUploadedFile(file);
+    setSelectedSample(sampleMeta);
     setAnalysisReport(null);
     setErrorMsg(null);
+
+    const objectUrl = URL.createObjectURL(file);
+    setPreviewVideoUrl(objectUrl);
     if (videoRef.current) {
       videoRef.current.currentTime = 0;
     }
   };
+
+  // Quick Select handler: fetches public sample video blob, wraps in File, and passes to processVideoFile
+  const handleQuickSelect = async (sample: SampleItem) => {
+    const isViolence = sample.category === "Violence";
+    const sampleUrl = isViolence ? "/samples/violence_sample.mp4" : "/samples/safe_sample.mp4";
+    const fileName = isViolence ? "violence_sample.mp4" : "safe_sample.mp4";
+
+    try {
+      setSelectedSample(sample);
+      setAnalysisReport(null);
+      setErrorMsg(null);
+
+      const response = await fetch(sampleUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch ${sampleUrl} (${response.status})`);
+      }
+      const blob = await response.blob();
+      const file = new File([blob], fileName, { type: "video/mp4" });
+      processVideoFile(file, sample);
+    } catch (err: any) {
+      console.warn("Could not preload sample blob:", err);
+      // Fallback: still show preview if direct URL works
+      setSelectedSample(sample);
+      setPreviewVideoUrl(sampleUrl);
+    }
+  };
+
+  // Load initial preset sample blob on mount
+  useEffect(() => {
+    handleQuickSelect(PRESET_SAMPLES[0]);
+  }, []);
 
   // Handle uploaded video file
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -170,16 +203,7 @@ export default function AppleGradeVisionDashboard() {
       return;
     }
 
-    setUploadedFile(file);
-    setSelectedSample(null);
-    setAnalysisReport(null);
-    setErrorMsg(null);
-
-    const objectUrl = URL.createObjectURL(file);
-    setPreviewVideoUrl(objectUrl);
-    if (videoRef.current) {
-      videoRef.current.currentTime = 0;
-    }
+    processVideoFile(file, null);
   };
 
   // Drag and drop handlers
@@ -202,16 +226,7 @@ export default function AppleGradeVisionDashboard() {
       setErrorMsg("Please upload an MP4 video file.");
       return;
     }
-    setUploadedFile(file);
-    setSelectedSample(null);
-    setAnalysisReport(null);
-    setErrorMsg(null);
-
-    const objectUrl = URL.createObjectURL(file);
-    setPreviewVideoUrl(objectUrl);
-    if (videoRef.current) {
-      videoRef.current.currentTime = 0;
-    }
+    processVideoFile(file, null);
   };
 
   // Run batch video analysis
@@ -221,9 +236,26 @@ export default function AppleGradeVisionDashboard() {
     setAnalysisReport(null);
 
     try {
+      let fileToSend = uploadedFile;
+      if (!fileToSend && selectedSample) {
+        try {
+          const isViolence = selectedSample.category === "Violence";
+          const sampleUrl = isViolence ? "/samples/violence_sample.mp4" : "/samples/safe_sample.mp4";
+          const fileName = isViolence ? "violence_sample.mp4" : "safe_sample.mp4";
+          const sRes = await fetch(sampleUrl);
+          if (sRes.ok) {
+            const blob = await sRes.blob();
+            fileToSend = new File([blob], fileName, { type: "video/mp4" });
+            setUploadedFile(fileToSend);
+          }
+        } catch (e) {
+          console.warn("Could not fetch sample blob during analysis:", e);
+        }
+      }
+
       const formData = new FormData();
-      if (uploadedFile) {
-        formData.append("file", uploadedFile);
+      if (fileToSend) {
+        formData.append("file", fileToSend);
       } else if (selectedSample) {
         formData.append("sample_name", selectedSample.id);
       } else {
@@ -483,14 +515,14 @@ python run_live.py --source 0`;
                 </span>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
                   {PRESET_SAMPLES.map((sample) => {
-                    const isSelected = selectedSample?.id === sample.id && !uploadedFile;
+                    const isSelected = selectedSample?.id === sample.id;
                     const isViolence = sample.category === "Violence";
 
                     return (
                       <motion.button
                         key={sample.id}
                         id={`sample-btn-${sample.id.replace(/\W/g, "-")}`}
-                        onClick={() => handleSelectSample(sample)}
+                        onClick={() => handleQuickSelect(sample)}
                         disabled={isAnalyzing}
                         whileHover={{ scale: 1.01 }}
                         whileTap={{ scale: 0.985 }}
