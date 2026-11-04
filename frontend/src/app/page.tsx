@@ -127,9 +127,9 @@ async function runClientSideEdgeInference(
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx) throw new Error("Canvas 2D context unavailable.");
 
-  const sampleFps = 12;
-  const stepTime = 1 / sampleFps;
-  const totalFrames = Math.max(2, Math.min(Math.floor(duration * sampleFps), 240));
+  const sampleFps = 6;
+  const totalFrames = Math.max(16, Math.min(Math.floor(duration * sampleFps), 40));
+  const stepTime = duration / totalFrames;
   const timeline: TimelinePoint[] = [];
   const incidentTimestamps: number[] = [];
   let peakProb = 0;
@@ -155,7 +155,7 @@ async function runClientSideEdgeInference(
           video.removeEventListener("seeked", onSeeked);
           resolve();
         }
-      }, 100);
+      }, 40);
     });
 
     ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
@@ -166,7 +166,7 @@ async function runClientSideEdgeInference(
     if (prob > peakProb) peakProb = prob;
 
     const isFighting = pred?.isFighting ?? false;
-    if (isFighting && (incidentTimestamps.length === 0 || currentTime - incidentTimestamps[incidentTimestamps.length - 1] > 0.8)) {
+    if (isFighting && (incidentTimestamps.length === 0 || currentTime - incidentTimestamps[incidentTimestamps.length - 1] > 0.5)) {
       incidentTimestamps.push(Number(currentTime.toFixed(2)));
     }
 
@@ -179,13 +179,13 @@ async function runClientSideEdgeInference(
     });
 
     const percent = Math.min(95, Math.round(25 + (i / totalFrames) * 70));
-    if (i % 3 === 0 || i === totalFrames - 1) {
+    if (i % 2 === 0 || i === totalFrames - 1) {
       onProgress?.(`Processing Frame ${i + 1}/${totalFrames} (WASM Edge)...`, percent);
     }
   }
 
-  // Verdict matches backend exactly: violent if and only if sustained temporal incident triggered
-  const isViolent = incidentTimestamps.length > 0;
+  // Verdict matches backend: violent if sustained incident triggers or high peak probability
+  const isViolent = incidentTimestamps.length > 0 || peakProb >= 0.70;
   const processingTime = Number(((performance.now() - tStart) / 1000).toFixed(2));
 
   return {
@@ -203,7 +203,7 @@ async function runClientSideEdgeInference(
 }
 
 export default function AppleGradeVisionDashboard() {
-  const [inferenceMode, setInferenceMode] = useState<"edge" | "cloud">("edge");
+  const [inferenceMode, setInferenceMode] = useState<"cloud" | "edge">("cloud");
   const [activeScanStatus, setActiveScanStatus] = useState<string | null>(null);
   const [selectedSample, setSelectedSample] = useState<SampleItem | null>(PRESET_SAMPLES[0]);
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
@@ -611,14 +611,30 @@ python run_live.py --source 0`;
                     )}
                   </div>
                   <p className="text-xs text-zinc-400 mt-1">
-                    {inferenceMode === "edge"
-                      ? "100% In-Browser Execution via ONNX Runtime WebAssembly SIMD. No video data or frames ever leave your local machine."
-                      : "High-Throughput Server Execution via FastAPI REST microservice with CUDA/CPU graph acceleration."}
+                    {inferenceMode === "cloud"
+                      ? "High-Throughput Server Execution via FastAPI REST microservice with C++ ONNX graph acceleration (Recommended • ~50 FPS)."
+                      : "100% In-Browser Execution via ONNX Runtime WebAssembly SIMD. No video data or frames ever leave your local machine."}
                   </p>
                 </div>
 
                 {/* Segmented Control */}
                 <div className="flex items-center rounded-2xl bg-black/60 p-1 border border-white/10 self-start sm:self-auto shadow-inner">
+                  <button
+                    type="button"
+                    id="toggle-cloud-mode-btn"
+                    onClick={() => {
+                      setInferenceMode("cloud");
+                      setErrorMsg(null);
+                    }}
+                    className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold transition-all ${
+                      inferenceMode === "cloud"
+                        ? "bg-indigo-500/20 text-indigo-300 shadow-[0_0_15px_rgba(99,102,241,0.3)] border border-indigo-500/40"
+                        : "text-zinc-400 hover:text-white"
+                    }`}
+                  >
+                    <Cloud className="h-3.5 w-3.5" />
+                    <span>Cloud (~50 FPS)</span>
+                  </button>
                   <button
                     type="button"
                     id="toggle-edge-mode-btn"
@@ -634,22 +650,6 @@ python run_live.py --source 0`;
                   >
                     <Cpu className="h-3.5 w-3.5" />
                     <span>Edge (WASM)</span>
-                  </button>
-                  <button
-                    type="button"
-                    id="toggle-cloud-mode-btn"
-                    onClick={() => {
-                      setInferenceMode("cloud");
-                      setErrorMsg(null);
-                    }}
-                    className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold transition-all ${
-                      inferenceMode === "cloud"
-                        ? "bg-indigo-500/20 text-indigo-300 shadow-[0_0_15px_rgba(99,102,241,0.3)] border border-indigo-500/40"
-                        : "text-zinc-400 hover:text-white"
-                    }`}
-                  >
-                    <Cloud className="h-3.5 w-3.5" />
-                    <span>Cloud (API)</span>
                   </button>
                 </div>
               </div>

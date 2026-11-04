@@ -22,7 +22,7 @@ export const VIOLENCE_THRESHOLD = 0.65;
 export const BIO_SCORE_FLOOR = 0.56;
 export const STRONG_BIO_SCORE_THRESHOLD = 0.60;
 export const CONSECUTIVE_TRIGGERS_REQUIRED = 2;
-export const ALERT_HOLD_FRAMES = 3;
+export const ALERT_HOLD_FRAMES = 8;
 export const POSE_STRIDE = 2;
 export const TURBULENCE_BOOST_THRESHOLD = 0.08;
 export const TURBULENCE_BOOST_AMOUNT = 0.18;
@@ -545,6 +545,47 @@ export function biomechanicalScore(
     }
   }
   return score;
+}
+
+// ─── Relational Strike Distance (mirrors Python inference.py) ─────────────────
+export const STRIKE_JOINTS = [9, 10, 15, 16]; // Wrists and Ankles
+export const TARGET_JOINTS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]; // Nose to Hips
+
+export function computeRelationalStrikeDistance(
+  kpsA: Float32Array,
+  boxB: BBox,
+  kpsB: Float32Array,
+  boxA: BBox,
+  frameW: number,
+  frameH: number,
+): number {
+  let minDist = Infinity;
+
+  const check = (strikerKps: Float32Array, targetBox: BBox, targetKps: Float32Array) => {
+    for (const sIdx of STRIKE_JOINTS) {
+      const sx = strikerKps[sIdx * 2] * frameW;
+      const sy = strikerKps[sIdx * 2 + 1] * frameH;
+      if (sx === 0 && sy === 0) continue;
+
+      for (const tIdx of TARGET_JOINTS) {
+        const tx = targetKps[tIdx * 2] * frameW;
+        const ty = targetKps[tIdx * 2 + 1] * frameH;
+        if (tx === 0 && ty === 0) continue;
+        const d = Math.hypot(sx - tx, sy - ty);
+        if (d < minDist) minDist = d;
+      }
+
+      const dx = Math.max(targetBox.x1 - sx, 0, sx - targetBox.x2);
+      const dy = Math.max(targetBox.y1 - sy, 0, sy - targetBox.y2);
+      const bDist = Math.hypot(dx, dy);
+      if (bDist < minDist) minDist = bDist;
+    }
+  };
+
+  check(kpsA, boxB, kpsB);
+  check(kpsB, boxA, kpsA);
+
+  return minDist;
 }
 
 // ─── Optical turbulence in interaction zone ────────────────────────────────────
