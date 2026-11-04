@@ -27,6 +27,7 @@ import {
   Cloud,
   Lock,
 } from "lucide-react";
+import { edgeEngine } from "@/lib/edgeEngine";
 
 // ─── Data Types ─────────────────────────────────────────────────────────────
 interface TimelinePoint {
@@ -96,7 +97,9 @@ async function runClientSideEdgeInference(
   videoUrl: string,
   onProgress?: (status: string, percent: number) => void
 ): Promise<AnalysisReport> {
-  const { edgeEngine } = await import("@/lib/edgeEngine");
+  if (typeof window === "undefined") {
+    throw new Error("Edge WASM inference requires a browser environment.");
+  }
 
   if (edgeEngine.state !== "ready") {
     onProgress?.("Allocating WebAssembly SIMD Runtime...", 10);
@@ -416,6 +419,11 @@ export default function AppleGradeVisionDashboard() {
       }
     } catch (err: any) {
       console.error("Analysis error:", err);
+      if (err?.message?.includes("Failed to load chunk") || err?.name === "ChunkLoadError") {
+        setErrorMsg("A newer deployment is active. Please perform a hard refresh (Ctrl+F5 or Shift+Reload) to load the latest application bundle.");
+        setAnalysisReport(null);
+        return;
+      }
       const isEdge = inferenceMode === "edge";
       setErrorMsg(
         isEdge
