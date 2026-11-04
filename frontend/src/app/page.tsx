@@ -24,6 +24,8 @@ import {
   ChevronRight,
   Shield,
   Zap,
+  Cloud,
+  Lock,
 } from "lucide-react";
 
 // ─── Data Types ─────────────────────────────────────────────────────────────
@@ -90,7 +92,115 @@ const SCAN_STEPS = [
   "Synthesizing Biomechanical Telemetry...",
 ];
 
+async function runClientSideEdgeInference(
+  videoUrl: string,
+  onProgress?: (status: string, percent: number) => void
+): Promise<AnalysisReport> {
+  const { edgeEngine } = await import("@/lib/edgeEngine");
+
+  if (edgeEngine.state !== "ready") {
+    onProgress?.("Allocating WebAssembly SIMD Runtime...", 10);
+    await edgeEngine.load((p) => onProgress?.(p.stage, 25));
+  }
+  edgeEngine.reset();
+
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.src = videoUrl;
+
+  await new Promise<void>((resolve, reject) => {
+    video.onloadedmetadata = () => resolve();
+    video.onerror = () => reject(new Error("Unable to load video element for local WASM frame extraction."));
+    if (video.readyState >= 1) resolve();
+  });
+
+  const duration = video.duration && isFinite(video.duration) ? video.duration : 4.0;
+  const canvas = document.createElement("canvas");
+  const targetWidth = 320;
+  const targetHeight = 320;
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) throw new Error("Canvas 2D context unavailable.");
+
+  const sampleFps = 12;
+  const stepTime = 1 / sampleFps;
+  const totalFrames = Math.max(2, Math.min(Math.floor(duration * sampleFps), 240));
+  const timeline: TimelinePoint[] = [];
+  const incidentTimestamps: number[] = [];
+  let peakProb = 0;
+  const tStart = performance.now();
+
+  for (let i = 0; i < totalFrames; i++) {
+    const currentTime = i * stepTime;
+    video.currentTime = currentTime;
+
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const onSeeked = () => {
+        if (!done) {
+          done = true;
+          video.removeEventListener("seeked", onSeeked);
+          resolve();
+        }
+      };
+      video.addEventListener("seeked", onSeeked);
+      setTimeout(() => {
+        if (!done) {
+          done = true;
+          video.removeEventListener("seeked", onSeeked);
+          resolve();
+        }
+      }, 100);
+    });
+
+    ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
+    const frameData = ctx.getImageData(0, 0, targetWidth, targetHeight);
+
+    const pred = await edgeEngine.processFrame(frameData);
+    const prob = pred?.probability ?? 0;
+    if (prob > peakProb) peakProb = prob;
+
+    const isFighting = pred?.isFighting ?? false;
+    if (isFighting && (incidentTimestamps.length === 0 || currentTime - incidentTimestamps[incidentTimestamps.length - 1] > 0.8)) {
+      incidentTimestamps.push(Number(currentTime.toFixed(2)));
+    }
+
+    timeline.push({
+      timestamp: Number(currentTime.toFixed(2)),
+      probability: Number(prob.toFixed(3)),
+      is_fighting: isFighting,
+      person_count: pred?.personCount ?? 0,
+      bio_score: Number((pred?.bioScore ?? 0).toFixed(2)),
+    });
+
+    const percent = Math.min(95, Math.round(25 + (i / totalFrames) * 70));
+    if (i % 3 === 0 || i === totalFrames - 1) {
+      onProgress?.(`Processing Frame ${i + 1}/${totalFrames} (WASM Edge)...`, percent);
+    }
+  }
+
+  const isViolent = incidentTimestamps.length > 0 || peakProb >= 0.65;
+  const processingTime = Number(((performance.now() - tStart) / 1000).toFixed(2));
+
+  return {
+    overall_verdict: isViolent ? "Violence" : "Safe",
+    confidence: isViolent ? peakProb : Math.max(0.05, 1 - peakProb),
+    incident_timestamps: incidentTimestamps,
+    processing_time_sec: processingTime,
+    frame_count: totalFrames,
+    video_duration_sec: Number(duration.toFixed(1)),
+    video_fps: sampleFps,
+    peak_probability: Number(peakProb.toFixed(3)),
+    is_sports_context: false,
+    timeline,
+  };
+}
+
 export default function AppleGradeVisionDashboard() {
+  const [inferenceMode, setInferenceMode] = useState<"edge" | "cloud">("edge");
+  const [activeScanStatus, setActiveScanStatus] = useState<string | null>(null);
   const [selectedSample, setSelectedSample] = useState<SampleItem | null>(PRESET_SAMPLES[0]);
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [previewVideoUrl, setPreviewVideoUrl] = useState<string>(PRESET_SAMPLES[0].videoUrl);
@@ -213,77 +323,108 @@ export default function AppleGradeVisionDashboard() {
     processVideoFile(file, null);
   };
 
-  // Run batch video analysis
+  // Run batch video analysis (Edge WASM vs Cloud API)
   const handleRunAnalysis = async () => {
     setIsAnalyzing(true);
     setErrorMsg(null);
     setAnalysisReport(null);
+    setActiveScanStatus(null);
 
     try {
-      let fileToSend = uploadedFile;
-      if (!fileToSend && selectedSample) {
-        try {
-          const isViolence = selectedSample.category === "Violence";
-          const sampleUrl = isViolence ? "/samples/violence_sample.mp4" : "/samples/safe_sample.mp4";
-          const fileName = isViolence ? "violence_sample.mp4" : "safe_sample.mp4";
-          const sRes = await fetch(sampleUrl);
-          if (sRes.ok) {
-            const blob = await sRes.blob();
-            fileToSend = new File([blob], fileName, { type: "video/mp4" });
-            setUploadedFile(fileToSend);
-          }
-        } catch (e) {
-          console.warn("Could not fetch sample blob during analysis:", e);
+      if (inferenceMode === "edge") {
+        // ── Edge Mode: 100% In-Browser Local WASM Inference ─────────────────
+        setActiveScanStatus("Initializing WebAssembly SIMD Runtime...");
+        const videoSourceUrl = previewVideoUrl;
+        if (!videoSourceUrl) {
+          throw new Error("No video stream selected for edge inference.");
         }
-      }
 
-      const formData = new FormData();
-      if (fileToSend) {
-        formData.append("file", fileToSend);
-      } else if (selectedSample) {
-        formData.append("sample_name", selectedSample.id);
+        const report = await runClientSideEdgeInference(videoSourceUrl, (stage, percent) => {
+          setActiveScanStatus(`${stage} (${percent}%)`);
+        });
+
+        setAnalysisReport(report);
+
+        // Jump video to first incident
+        const triggers = report?.incident_timestamps ?? [];
+        if (Array.isArray(triggers) && triggers.length > 0 && videoRef.current) {
+          videoRef.current.currentTime = Math.max(0, (triggers[0] ?? 0) - 0.5);
+        }
       } else {
-        throw new Error("No video selected for analysis.");
-      }
-
-      const res = await fetch("/api/analyze_video", {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!res.ok) {
-        let errorDetail = `Server returned error status ${res.status}`;
-        try {
-          const errJson = await res.json();
-          if (errJson?.detail) {
-            errorDetail = typeof errJson.detail === "string" ? errJson.detail : JSON.stringify(errJson.detail);
-          }
-        } catch {
-          const text = await res.text().catch(() => "");
-          if (res.status === 404 || text.includes("404")) {
-            errorDetail = "Backend endpoint not found (404). Please ensure the backend service is running.";
+        // ── Cloud Mode: FastAPI Server Microservice ─────────────────────────
+        setActiveScanStatus("Submitting payload to Cloud Microservice...");
+        let fileToSend = uploadedFile;
+        if (!fileToSend && selectedSample) {
+          try {
+            const isViolence = selectedSample.category === "Violence";
+            const sampleUrl = isViolence ? "/samples/violence_sample.mp4" : "/samples/safe_sample.mp4";
+            const fileName = isViolence ? "violence_sample.mp4" : "safe_sample.mp4";
+            const sRes = await fetch(sampleUrl);
+            if (sRes.ok) {
+              const blob = await sRes.blob();
+              fileToSend = new File([blob], fileName, { type: "video/mp4" });
+              setUploadedFile(fileToSend);
+            }
+          } catch (e) {
+            console.warn("Could not fetch sample blob during analysis:", e);
           }
         }
-        throw new Error(errorDetail);
-      }
 
-      const report: AnalysisReport = await res.json();
-      if (!report || typeof report !== "object") {
-        throw new Error("Invalid response format received from inference service.");
-      }
+        const formData = new FormData();
+        if (fileToSend) {
+          formData.append("file", fileToSend);
+        } else if (selectedSample) {
+          formData.append("sample_name", selectedSample.id);
+        } else {
+          throw new Error("No video selected for analysis.");
+        }
 
-      setAnalysisReport(report);
+        const res = await fetch("/api/analyze_video", {
+          method: "POST",
+          body: formData,
+        });
 
-      // Jump video to first incident
-      const triggers = report?.incident_timestamps ?? [];
-      if (Array.isArray(triggers) && triggers.length > 0 && videoRef.current) {
-        videoRef.current.currentTime = Math.max(0, (triggers[0] ?? 0) - 0.5);
+        if (!res.ok) {
+          let errorDetail = `Server returned error status ${res.status}`;
+          try {
+            const errJson = await res.json();
+            if (errJson?.detail) {
+              errorDetail = typeof errJson.detail === "string" ? errJson.detail : JSON.stringify(errJson.detail);
+            }
+          } catch {
+            const text = await res.text().catch(() => "");
+            if (res.status === 404 || text.includes("404")) {
+              errorDetail = "Backend endpoint not found (404). Toggle to Edge Mode (WASM) for local in-browser inference.";
+            }
+          }
+          throw new Error(errorDetail);
+        }
+
+        const report: AnalysisReport = await res.json();
+        if (!report || typeof report !== "object") {
+          throw new Error("Invalid response format received from inference service.");
+        }
+
+        setAnalysisReport(report);
+
+        // Jump video to first incident
+        const triggers = report?.incident_timestamps ?? [];
+        if (Array.isArray(triggers) && triggers.length > 0 && videoRef.current) {
+          videoRef.current.currentTime = Math.max(0, (triggers[0] ?? 0) - 0.5);
+        }
       }
     } catch (err: any) {
-      setErrorMsg(err?.message || "Failed to process video analysis. Please check your backend connection.");
+      console.error("Analysis error:", err);
+      const isEdge = inferenceMode === "edge";
+      setErrorMsg(
+        isEdge
+          ? `Edge WASM Notice: ${err?.message || "WebAssembly inference failed"}. You can toggle to Cloud Mode for server analysis.`
+          : (err?.message || "Failed to process video analysis. Please check your backend connection.")
+      );
       setAnalysisReport(null);
     } finally {
       setIsAnalyzing(false);
+      setActiveScanStatus(null);
     }
   };
 
@@ -337,8 +478,28 @@ python run_live.py --source 0`;
             </div>
           </div>
 
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3.5 py-1.5 text-xs backdrop-blur-xl shadow-inner">
+          <div className="flex items-center gap-2.5">
+            {/* Active Privacy Mode Badge */}
+            <div className="flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs backdrop-blur-xl shadow-inner">
+              {inferenceMode === "edge" ? (
+                <>
+                  <Shield className="h-3 w-3 text-emerald-400" />
+                  <span className="text-emerald-300 text-[11px] font-semibold">
+                    Privacy: High (Local WASM)
+                  </span>
+                </>
+              ) : (
+                <>
+                  <Cloud className="h-3 w-3 text-indigo-400" />
+                  <span className="text-indigo-300 text-[11px] font-semibold">
+                    Privacy: Standard (Cloud API)
+                  </span>
+                </>
+              )}
+            </div>
+
+            {/* Cloud Backend Connectivity Status */}
+            <div className="hidden sm:flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3.5 py-1.5 text-xs backdrop-blur-xl shadow-inner">
               <span
                 className={`h-2 w-2 rounded-full transition-all duration-300 ${
                   apiConnected === true
@@ -350,9 +511,9 @@ python run_live.py --source 0`;
               />
               <span className="text-zinc-300 text-[11px] font-medium">
                 {apiConnected === true
-                  ? "Cloud API Connected"
+                  ? "Cloud API Online"
                   : apiConnected === false
-                  ? "API Offline (Run Locally)"
+                  ? "Cloud API Offline"
                   : "Connecting..."}
               </span>
             </div>
@@ -419,6 +580,72 @@ python run_live.py --source 0`;
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-7 items-start">
           {/* Left Column: Input Dropzone & Video Preview (7 cols) */}
           <div className="lg:col-span-7 space-y-6">
+            {/* ── Architectural Mode Switcher: Edge vs Cloud ────────────────── */}
+            <div className="rounded-3xl border border-white/[0.08] bg-white/[0.025] backdrop-blur-2xl p-5 shadow-[0_8px_32px_0_rgba(0,0,0,0.36)] space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-semibold tracking-tight text-white flex items-center gap-1.5">
+                      <Cpu className="h-4 w-4 text-zinc-300" />
+                      Inference Engine & Architecture
+                    </span>
+                    {inferenceMode === "edge" ? (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold tracking-wide uppercase bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                        <Shield className="h-2.5 w-2.5 text-emerald-400" />
+                        Privacy: High (Local WASM)
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold tracking-wide uppercase bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                        <Cloud className="h-2.5 w-2.5 text-indigo-400" />
+                        Privacy: Standard (Cloud API)
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-zinc-400 mt-1">
+                    {inferenceMode === "edge"
+                      ? "100% In-Browser Execution via ONNX Runtime WebAssembly SIMD. No video data or frames ever leave your local machine."
+                      : "High-Throughput Server Execution via FastAPI REST microservice with CUDA/CPU graph acceleration."}
+                  </p>
+                </div>
+
+                {/* Segmented Control */}
+                <div className="flex items-center rounded-2xl bg-black/60 p-1 border border-white/10 self-start sm:self-auto shadow-inner">
+                  <button
+                    type="button"
+                    id="toggle-edge-mode-btn"
+                    onClick={() => {
+                      setInferenceMode("edge");
+                      setErrorMsg(null);
+                    }}
+                    className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold transition-all ${
+                      inferenceMode === "edge"
+                        ? "bg-emerald-500/20 text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.3)] border border-emerald-500/40"
+                        : "text-zinc-400 hover:text-white"
+                    }`}
+                  >
+                    <Cpu className="h-3.5 w-3.5" />
+                    <span>Edge (WASM)</span>
+                  </button>
+                  <button
+                    type="button"
+                    id="toggle-cloud-mode-btn"
+                    onClick={() => {
+                      setInferenceMode("cloud");
+                      setErrorMsg(null);
+                    }}
+                    className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold transition-all ${
+                      inferenceMode === "cloud"
+                        ? "bg-indigo-500/20 text-indigo-300 shadow-[0_0_15px_rgba(99,102,241,0.3)] border border-indigo-500/40"
+                        : "text-zinc-400 hover:text-white"
+                    }`}
+                  >
+                    <Cloud className="h-3.5 w-3.5" />
+                    <span>Cloud (API)</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
             {/* Hick's Law Action Hub: Massive Drag & Drop Zone */}
             <div className="rounded-3xl border border-white/[0.08] bg-white/[0.025] backdrop-blur-2xl p-6 shadow-[0_8px_32px_0_rgba(0,0,0,0.36)] space-y-5">
               <div className="flex items-center justify-between">
@@ -595,18 +822,25 @@ python run_live.py --source 0`;
                 className={`w-full py-4 px-6 rounded-2xl font-bold text-sm tracking-wide transition shadow-xl flex items-center justify-center gap-3 ${
                   isAnalyzing
                     ? "bg-zinc-800/80 text-zinc-400 cursor-not-allowed border border-white/10"
+                    : inferenceMode === "edge"
+                    ? "bg-emerald-400 hover:bg-emerald-300 text-zinc-950 shadow-[0_4px_24px_rgba(52,211,153,0.3)] border border-emerald-300 active:scale-[0.99]"
                     : "bg-white text-zinc-950 hover:bg-zinc-100 shadow-[0_4px_24px_rgba(255,255,255,0.15)] border border-white active:scale-[0.99]"
                 }`}
               >
                 {isAnalyzing ? (
                   <>
                     <RefreshCw className="h-4 w-4 text-indigo-400 animate-spin" />
-                    <span>Processing Neural Pipeline...</span>
+                    <span>{activeScanStatus || "Processing Neural Pipeline..."}</span>
+                  </>
+                ) : inferenceMode === "edge" ? (
+                  <>
+                    <Zap className="h-4 w-4 text-zinc-900 fill-zinc-900" />
+                    <span>Run Edge WASM Analysis (Local Private)</span>
                   </>
                 ) : (
                   <>
-                    <Zap className="h-4 w-4 text-zinc-900 fill-zinc-900" />
-                    <span>Run Kinematic ST-GCN Analysis</span>
+                    <Cloud className="h-4 w-4 text-zinc-900 fill-zinc-900" />
+                    <span>Run Cloud Microservice Analysis (FastAPI)</span>
                   </>
                 )}
               </motion.button>
@@ -614,10 +848,36 @@ python run_live.py --source 0`;
               {errorMsg && (
                 <div
                   id="analysis-error-banner"
-                  className="rounded-2xl border border-rose-500/30 bg-rose-950/20 p-4 text-xs text-rose-300 flex items-center gap-2.5 backdrop-blur-md"
+                  className="rounded-2xl border border-rose-500/30 bg-rose-950/20 p-4 text-xs text-rose-300 flex flex-col sm:flex-row sm:items-center justify-between gap-3 backdrop-blur-md"
                 >
-                  <AlertTriangle className="h-4 w-4 text-rose-400 flex-shrink-0" />
-                  <span>{errorMsg}</span>
+                  <div className="flex items-center gap-2.5">
+                    <AlertTriangle className="h-4 w-4 text-rose-400 flex-shrink-0" />
+                    <span>{errorMsg}</span>
+                  </div>
+                  {inferenceMode === "edge" && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setInferenceMode("cloud");
+                        setErrorMsg(null);
+                      }}
+                      className="px-3 py-1.5 rounded-xl text-[11px] font-semibold bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 border border-indigo-400/30 self-start sm:self-auto transition"
+                    >
+                      Switch to Cloud Mode
+                    </button>
+                  )}
+                  {inferenceMode === "cloud" && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setInferenceMode("edge");
+                        setErrorMsg(null);
+                      }}
+                      className="px-3 py-1.5 rounded-xl text-[11px] font-semibold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border border-emerald-400/30 self-start sm:self-auto transition"
+                    >
+                      Switch to Edge Mode
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -633,9 +893,14 @@ python run_live.py --source 0`;
                     Telemetry & Verdict
                   </h3>
                 </div>
-                <span className="text-[11px] font-mono text-zinc-400">
-                  {analysisReport ? `${analysisReport?.processing_time_sec ?? 0}s runtime` : "Standby"}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-semibold font-mono uppercase px-2 py-0.5 rounded-full border border-white/10 bg-white/[0.04] text-zinc-300">
+                    {inferenceMode === "edge" ? "Local WASM" : "Cloud ST-GCN"}
+                  </span>
+                  <span className="text-[11px] font-mono text-zinc-400">
+                    {analysisReport ? `${analysisReport?.processing_time_sec ?? 0}s runtime` : "Standby"}
+                  </span>
+                </div>
               </div>
 
               {/* State 1: Active Waiting / Progress State (UX Psychology) */}
@@ -667,13 +932,13 @@ python run_live.py --source 0`;
                       </h4>
                       <AnimatePresence mode="wait">
                         <motion.p
-                          key={scanStepIndex}
+                          key={activeScanStatus || scanStepIndex}
                           initial={{ opacity: 0, y: 4 }}
                           animate={{ opacity: 1, y: 0 }}
                           exit={{ opacity: 0, y: -4 }}
                           className="text-xs font-mono text-indigo-300 h-5"
                         >
-                          {SCAN_STEPS[scanStepIndex]}
+                          {activeScanStatus || SCAN_STEPS[scanStepIndex]}
                         </motion.p>
                       </AnimatePresence>
                       <p className="text-[11px] text-zinc-400 max-w-xs mx-auto leading-relaxed pt-1">
