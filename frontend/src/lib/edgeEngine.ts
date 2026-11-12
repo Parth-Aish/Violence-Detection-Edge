@@ -91,61 +91,66 @@ export class EdgeEngine {
   ): Promise<void> {
     this._state = "loading";
     try {
-      onProgress?.({ stage: "Probing hardware acceleration (WebGPU → WebGL → WASM SIMD)..." });
+      onProgress?.({ stage: "Probing execution backend (WebGPU / Multi-Thread WASM SIMD)..." });
 
-      // Configure WASM fallback: SIMD + multi-threading
-      ort.env.wasm.numThreads = Math.min(
-        typeof navigator !== "undefined" && navigator.hardwareConcurrency ? navigator.hardwareConcurrency : 4,
-        4,
-      );
+      const isIsolated = typeof crossOriginIsolated !== "undefined" && crossOriginIsolated;
+      const hwThreads = typeof navigator !== "undefined" && navigator.hardwareConcurrency
+        ? navigator.hardwareConcurrency
+        : 4;
+      const wasmThreads = isIsolated ? Math.min(4, hwThreads) : 1;
+
+      ort.env.wasm.numThreads = wasmThreads;
       ort.env.wasm.simd = true;
       ort.env.wasm.wasmPaths = "/ort-wasm/";
 
-      // Execution provider fallback chain: WebGPU (GPU) → WebGL (GPU) → WASM SIMD (CPU)
-      const options: ort.InferenceSession.SessionOptions = {
-        executionProviders: ["webgpu", "webgl", "wasm"],
+      // Only request WebGPU if an active GPU adapter is actually exposed by the browser.
+      // Avoid requesting legacy "webgl" which is absent from the standard ort bundle and logs errors.
+      let hasWebGpu = false;
+      try {
+        if (typeof navigator !== "undefined" && "gpu" in navigator) {
+          const adapter = await (navigator as any).gpu?.requestAdapter?.();
+          hasWebGpu = Boolean(adapter);
+        }
+      } catch {
+        hasWebGpu = false;
+      }
+
+      const wasmOpts: ort.InferenceSession.SessionOptions = {
+        executionProviders: ["wasm"],
         graphOptimizationLevel: "all",
         executionMode: "sequential",
       };
-      if (typeof navigator !== "undefined" && navigator.hardwareConcurrency) {
-        (options as any).intraOpNumThreads = Math.min(4, navigator.hardwareConcurrency);
-      }
+      (wasmOpts as any).intraOpNumThreads = wasmThreads;
 
-      onProgress?.({ stage: "Compiling ONNX graph kernels (GPU-accelerated if available)..." });
+      const preferredOpts: ort.InferenceSession.SessionOptions = {
+        executionProviders: hasWebGpu ? ["webgpu", "wasm"] : ["wasm"],
+        graphOptimizationLevel: "all",
+        executionMode: "sequential",
+      };
+      (preferredOpts as any).intraOpNumThreads = wasmThreads;
 
+      onProgress?.({
+        stage: hasWebGpu
+          ? "Compiling ONNX graph kernels (WebGPU)..."
+          : `Compiling ONNX kernels (WASM SIMD • ${wasmThreads}T)...`,
+      });
+
+      let usedWebGpu = hasWebGpu;
       try {
         [this.poseSession, this.stgcnSession] = await Promise.all([
-          ort.InferenceSession.create("/models/yolov8n-pose.onnx", options),
-          ort.InferenceSession.create("/models/violence_stgcn.onnx", options),
+          ort.InferenceSession.create("/models/yolov8n-pose.onnx", preferredOpts),
+          ort.InferenceSession.create("/models/violence_stgcn.onnx", preferredOpts),
         ]);
       } catch (gpuErr) {
-        // Fallback strictly to multi-threaded WASM if WebGPU/WebGL initialization fails on driver
-        console.warn("GPU execution provider initialization failed, falling back to WASM:", gpuErr);
-        const wasmOpts: ort.InferenceSession.SessionOptions = {
-          executionProviders: ["wasm"],
-          graphOptimizationLevel: "all",
-          executionMode: "sequential",
-        };
-        if (typeof navigator !== "undefined" && navigator.hardwareConcurrency) {
-          (wasmOpts as any).intraOpNumThreads = Math.min(4, navigator.hardwareConcurrency);
-        }
+        usedWebGpu = false;
+        console.warn("WebGPU initialization failed, using WASM SIMD:", gpuErr);
         [this.poseSession, this.stgcnSession] = await Promise.all([
           ort.InferenceSession.create("/models/yolov8n-pose.onnx", wasmOpts),
           ort.InferenceSession.create("/models/violence_stgcn.onnx", wasmOpts),
         ]);
       }
 
-      // Detect which execution provider was actually selected
-      this._backend = "WASM-SIMD";
-      try {
-        // WebGPU sessions expose an internal property; probe it
-        const poseProvider = (this.poseSession as any)?.handler?.backend;
-        if (typeof poseProvider === "string") {
-          if (poseProvider.toLowerCase().includes("webgpu")) this._backend = "WebGPU";
-          else if (poseProvider.toLowerCase().includes("webgl")) this._backend = "WebGL";
-        }
-      } catch { /* detection is best-effort */ }
-
+      this._backend = usedWebGpu ? "WebGPU" : `WASM-SIMD-${wasmThreads}T`;
       onProgress?.({ stage: `Edge Models Ready (${this._backend})` });
       this._state = "ready";
     } catch (err) {
@@ -164,15 +169,16 @@ export class EdgeEngine {
   }
 
   // ─── Main inference entry ───────────────────────────────────────────────────
-  async processFrame(frameData: ImageData): Promise<EdgePrediction> {
+  async processFrame(frameData: ImageData, strideOverride?: number): Promise<EdgePrediction> {
     if (!this.poseSession || !this.stgcnSession) {
       throw new Error("EdgeEngine not loaded");
     }
     const t0 = performance.now();
     const { width, height } = frameData;
-    const isPoseFrame = this.frameIndex % POSE_STRIDE === 0;
+    const effectiveStride = Math.max(1, strideOverride ?? POSE_STRIDE);
+    const isPoseFrame = (this.frameIndex % effectiveStride === 0) || (this.poses.length < SEQUENCE_LENGTH);
 
-    // 1. Pose extraction (strided for throughput)
+    // 1. Pose extraction
     let detections: Detection[];
     if (isPoseFrame) {
       detections = await this._detectPose(frameData);

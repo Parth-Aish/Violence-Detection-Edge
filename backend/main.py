@@ -190,7 +190,12 @@ async def normalize_slashes_middleware(request: Request, call_next: Any):
     raw_path = request.scope.get("path", "")
     if "//" in raw_path:
         request.scope["path"] = re.sub(r"/+", "/", raw_path)
-    return await call_next(request)
+    response = await call_next(request)
+    # Unlock SharedArrayBuffer multi-threaded WebAssembly (crossOriginIsolated)
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
+    response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
+    return response
 
 
 @app.get("/api/health")
