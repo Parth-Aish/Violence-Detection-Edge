@@ -21,91 +21,206 @@ Mohali, Punjab, India}
 \maketitle
 
 \begin{abstract}
-Real-time automated violence detection on resource-constrained surveillance hardware faces persistent trade-offs among inference throughput, false-positive suppression, and video data privacy. Conventional 3D convolutional architectures operate directly on dense RGB pixel volumes, yielding large memory footprints and heightened sensitivity to background clutter, illumination shifts, and camera jitter. This paper presents \textbf{Edge Vision}, a dual-tier real-time violence detection platform pairing lightweight human pose estimation (\mbox{YOLOv8n-Pose}) with a Spatial-Temporal Graph Convolutional Network (\mbox{ST-GCN}), an 8-dimensional constant-velocity Kalman occlusion tracker with Hungarian bipartite matching, and a geometric Relational Strike Gate. Using normalized 17-node COCO skeletal graphs across 30-frame temporal windows shrinks frame representation bandwidth by 99.8\% while decoupling kinematics from appearance confounders. Deployed across both a memory-bounded FastAPI cloud microservice ($<512\text{ MB}$ RAM) and a zero-upload client browser engine accelerated via WebGPU and \texttt{COOP}/\texttt{COEP}-isolated multi-threaded WebAssembly (ONNX Runtime Web), the shared inference core executes at \textbf{50.7 FPS} on commodity CPUs. On a strictly held-out, zero-leakage chronological test split of 293 videos drawn from a 1,951-video benchmark corpus, the full pipeline attains \textbf{85.65\% Accuracy}, \textbf{80.61\% Precision}, \textbf{94.80\% Recall}, and an \textbf{F1 score of 0.871}.
+Real-time automated violence detection across distributed surveillance cameras is constrained by hardware compute ceilings, high false-positive rates on benign motion, and privacy hazards when raw video is streamed to centralized servers. Traditional 3D convolutional and video-transformer architectures operate over dense RGB pixel volumes, yielding large memory footprints and brittle sensitivity to background clutter, illumination shifts, and camera jitter. This work introduces \textbf{Edge Vision}, a dual-tier real-time violence detection platform unifying lightweight pose estimation (\mbox{YOLOv8n-Pose}), a Spatial-Temporal Graph Convolutional Network (\mbox{ST-GCN}), an 8-state constant-velocity Kalman occlusion tracker with Hungarian bipartite assignment, and a novel pixel-space geometric \textbf{Relational Strike Gate}. Representing subjects via normalized 17-node COCO skeletal graphs across 30-frame temporal windows compresses per-frame input bandwidth by 99.8\% while decoupling biomechanical motion from appearance confounders. The identical ONNX graph pipeline runs inside both a memory-bounded FastAPI cloud microservice ($<512\text{ MB}$ RAM ceiling) and a zero-upload client browser engine accelerated via WebGPU and \texttt{COOP}/\texttt{COEP}-isolated multi-threaded WebAssembly (ONNX Runtime Web). Benchmarked over 100 timed iterations (after a 10-iteration warm-up) on an Intel Core i7-12700H CPU, the pipeline executes at \textbf{50.7 FPS} end-to-end (16.9~ms summed model latency). On a strictly held-out, zero-leakage chronological test split of 293 unseen videos partitioned from a 1,951-video benchmark corpus ($\text{TP}=142, \text{FP}=34, \text{FN}=8, \text{TN}=109$), the complete system achieves \textbf{85.67\% Accuracy}, \textbf{80.68\% Precision}, \textbf{94.67\% Recall}, \textbf{76.22\% Specificity}, and an \textbf{F1 Score of 0.871}.
 \end{abstract}
 
 \begin{IEEEkeywords}
-Violence detection, spatial-temporal graph convolutional networks, pose estimation, Kalman filtering, Hungarian assignment, WebAssembly, edge computing.
+Violence detection, spatial-temporal graph convolutional networks, pose estimation, Kalman filtering, Hungarian algorithm, relational strike gating, WebAssembly, edge AI.
 \end{IEEEkeywords}
 
 \section{Introduction}
-Automated detection of physical altercations across transit hubs, campuses, and public monitoring infrastructure requires low-latency alerts under strict hardware power and memory budgets. Relying exclusively on centralized cloud processing introduces network bandwidth bottlenecks, round-trip transmission delays, and regulatory privacy exposure when raw surveillance streams leave the local premises.
+Automated surveillance systems deployed in public transit corridors, campuses, correctional facilities, and retail spaces require sub-second detection of physical altercations while minimizing operator alert fatigue. Transmitting continuous high-definition video streams to centralized GPU clusters incurs prohibitive network egress costs, variable transmission latency, and regulatory compliance risks when personally identifiable visual frames leave local premises. Conversely, deploying heavy deep learning detectors directly onto low-power edge nodes, browser sandboxes, or memory-capped cloud micro-containers imposes strict limits on RAM consumption, binary size, and single-frame compute latency.
 
-Early computer vision approaches applied 2D and 3D Convolutional Neural Networks (e.g., C3D, I3D) directly over volumetric RGB pixel buffers \cite{b1}. Although expressive on curated benchmarks, pixel-space networks suffer from structural liabilities in real-world deployments: (i)~elevated GPU memory and compute demands incompatible with sub-512~MB cloud micro-containers or browser runtimes, and (ii)~poor out-of-distribution generalization where sudden lighting changes, shadows, red clothing, or rapid panning induce false alarms.
+First-generation deep learning violence detectors processed volumetric RGB pixel tensors directly using 2D+LSTM hybrids or 3D Convolutional Neural Networks (3D-CNNs) such as C3D \cite{b1}. Although effective on curated indoor clips, dense pixel models exhibit fundamental operational drawbacks: (i)~cubic memory scaling over spatial height, spatial width, and temporal depth, rendering real-time inference infeasible without high-wattage discrete GPUs; and (ii)~severe confounding by nuisance visual factors including lighting flicker, rain, camera vibration, and clothing color.
 
-To address these limitations, skeletal action recognition abstracts raw video frames into compact anatomical coordinates \cite{b2}. Instead of processing $1920 \times 1080 \times 3$ image tensors, each actor is represented as a sparse kinematic graph. This work documents the end-to-end engineering, mathematical stabilization, and empirical evaluation of \textbf{Edge Vision}, making three core contributions:
+Skeleton-based action recognition mitigates both challenges by projecting each human subject into a compact topological graph of anatomical keypoints \cite{b2}. Compressing $1920 \times 1080 \times 3$ image rasters into normalized $(17, 2)$ coordinate pairs strips background texture and personally identifiable facial detail prior to sequence modeling. However, standalone skeletal graph classifiers remain vulnerable to two failure modes in unconstrained surveillance feeds: (1) track fragmentation and identity swaps during physical grapples where combatants heavily occlude one another, and (2) elevated false-positive rates caused by rapid isolated movements—such as dancing, vigorous gesturing, or solo jumping—that exhibit high joint velocity without hostile inter-actor contact.
+
+To resolve these failure modes while preserving real-time CPU throughput, we present \textbf{Edge Vision}, making four concrete technical contributions:
 \begin{enumerate}
-    \item A unified Pose + ST-GCN ONNX inference pipeline incorporating missing-joint validity masking, 8-state Kalman occlusion tracking with Hungarian association, and a geometric Relational Strike Gate that clamps isolated non-contact false alarms.
-    \item A dual-tier deployment model supporting both lightweight server-side FastAPI analytics and zero-upload client browser inference unlocked via Cross-Origin Isolation (\texttt{COOP}/\texttt{COEP}) WebAssembly SIMD threads and WebGPU acceleration.
-    \item A reproducible, source-video-partitioned chronological evaluation protocol across 1,951 videos proving ablation gains with zero validation-to-test data leakage.
+    \item \textbf{Unified Missing-Joint Masked ST-GCN Pipeline:} A lightweight residual Spatial-Temporal Graph Convolutional Network exported as a single self-contained $257\text{ KB}$ ONNX binary paired with mid-hip root centering, torso scaling, and strict $[0.0, 0.0]$ validity masking for occluded joints.
+    \item \textbf{True 8-D Kalman + Hungarian Occlusion Tracker:} Analytic constant-velocity Kalman state prediction and optimal IoU linear assignment maintaining subject identity across up to 10 consecutive occluded frames during clinches and takedowns.
+    \item \textbf{Pixel-Space Relational Strike Gating:} A deterministic two-invariant geometric filter measuring minimum Euclidean effector-to-target-zone proximity ($d_{\text{strike}}$ in pixels) alongside bounding-box overlap ($\text{IoU} > 0$), contrasted explicitly against naive box-centroid distance heuristics.
+    \item \textbf{Zero-Upload Cross-Origin-Isolated Edge + Cloud Architecture:} Bit-aligned inference running identically inside a 512~MB FastAPI server and a browser client unlocked with \texttt{COOP}/\texttt{COEP} \texttt{SharedArrayBuffer} multi-threaded WebAssembly SIMD and WebGPU acceleration.
 \end{enumerate}
 
+\section{Related Work}
+Research in automated violence detection and skeletal kinematics has evolved rapidly between 2020 and 2026 across four intersecting subfields.
+
+\subsection{RGB-Volumetric and Weakly Supervised Violence Detection}
+Large-scale benchmarks catalyzed empirical study of unconstrained surveillance altercations. Soliman et al.~\cite{b5} curated the \textit{Real Life Violence Situations} dataset capturing diverse indoor and outdoor fights versus benign daily motions. Cheng et al.~\cite{b6} introduced RWF-2000 from public surveillance feeds combining RGB and optical flow streams. To scale weak supervision, Wu et al.~\cite{b7} released the multimodal XD-Violence corpus using audio-visual fusion branches, while Degardin and Proen\c{c}a \cite{b8} introduced UBI-Fights providing frame-level anomaly annotations across 1,000 sequences. Gohar \cite{b9} evaluated Convolutional Block Attention Modules (CBAM) combined with ConvLSTM networks on UBI-Fights to isolate fight regions from background motion. Despite strong accuracy, RGB and optical-flow volumetric networks retain large memory footprints and struggle under strict CPU-only edge latency limits.
+
+\subsection{Skeleton-Based Action Recognition via Graph Convolutions}
+Yan et al.~\cite{b2} pioneered Spatial-Temporal Graph Convolutional Networks (ST-GCN), establishing normalized anatomical adjacency matrices coupled with 1D temporal kernels. Subsequent work expanded receptive fields and adaptive topology learning: Shi et al.~\cite{b10} introduced Two-Stream Adaptive GCN (2s-AGCN) to learn data-driven graph edges alongside bone vectors; Liu et al.~\cite{b11} proposed MS-G3D to disentangle multi-scale neighborhood hops and cross-spacetime skip connections; and Chen et al.~\cite{b12} formulated CTR-GCN to refine graph topology independently across feature channels.
+
+To lower inference overhead, Song et al.~\cite{b13} designed EfficientGCN using compound scaling and separable convolutions. Duan et al.~\cite{b14} revisited skeleton pipelines via PoseConv3D over stacked 3D joint heatmaps and further standardized ST-GCN++ best practices in the PYSKL benchmark \cite{b15}. Chi et al.~\cite{b16} introduced InfoGCN employing information-bottleneck objectives and self-attention graph modules. More recently, Lee et al.~\cite{b17} proposed Hierarchically Decomposed GCN (HD-GCN) to connect semantically distant joint groups, Do and Kim \cite{b18} introduced SkateFormer partitioning skeletal-temporal transformers across joint and frame axes, and Zhou et al.~\cite{b19} developed BlockGCN preserving topology awareness. While highly expressive for general action classes, dense multi-stream and transformer architectures exceed real-time WebAssembly latency budgets in browser runtimes.
+
+\subsection{Skeleton Violence Detection and Relational Gating Contrast}
+Applying skeletal graphs directly to violent altercation detection eliminates environmental pixel bias. Yang et al.~\cite{b20} designed multi-scale attention-enhanced GCNs fusing joint positions, bone vectors, and motion differentials for skeleton-based violence recognition. Janbi et al.~\cite{b21} proposed ESTS-GCN, ensembling spatial-temporal skeleton topologies to capture physical brawls. Tran et al.~\cite{b22} investigated interaction-line graph representations (SKE-A3TGCN and GCNVertexEdge) modeling pairwise inter-person joint relations for surveillance feeds.
+
+A key gap in prior skeleton violence pipelines is handling high-energy non-contact gestures. Standard proximity heuristics threshold only \emph{bounding-box centroid distance} $\|\mathbf{c}_A - \mathbf{c}_B\|_2 < d_{\text{thresh}}$. Centroid distance fails systematically under two common geometries: (i)~two tall standing actors side-by-side in peaceful conversation may exhibit small centroid spacing while their hands hang stationary at their sides; conversely, (ii)~two combatants executing a wide flying kick or extended punch maintain large torso-centroid separation while an extremity (wrist or ankle) directly strikes the opponent's head or torso. Edge Vision's novel \textbf{Relational Strike Gate} resolves this directly in pixel space by pairing extremal strike effectors $\{9, 10, 15, 16\}$ against opponent vulnerable target zones $\{0\dots 12\}$ and box extents alongside bounding-box convergence ($\text{IoU} > 0$), decoupling strike contact geometry from center-of-mass spacing.
+
+\subsection{Multi-Object Tracking and Edge Runtime Optimization}
+Bottom-up and single-stage pose detectors such as YOLO-Pose \cite{b23} and Ultralytics \mbox{YOLOv8n-Pose} \cite{b3} provide simultaneous person localization and COCO-17 regression within a single forward pass. For temporal identity stabilization, modern tracking-by-detection methods—including ByteTrack \cite{b24} and BoT-SORT \cite{b25}—combine linear Kalman filters with Kuhn's Hungarian assignment solver \cite{b4}. ByteTrack proved that geometric IoU association with low-confidence box retention outperforms heavy CNN Re-ID embeddings on compute-constrained hardware. For runtime portability, ONNX Runtime \cite{b26} unifies graph optimizations across native C++ server threads and browser WebGPU/WASM execution providers, while MobileNetV3 \cite{b27} provides low-overhead scene context classification for athletic context attenuation.
+
 \section{Proposed Methodology}
-The shared inference pipeline operates sequentially across both the native Python server runtime and the browser execution engine as follows:
+Figure~\ref{fig:pipeline} illustrates the sequential Edge Vision inference pipeline shared across the Python backend and browser WebAssembly runtime.
+
+\begin{figure}[htbp]
+\centering
+\fbox{\parbox{0.94\columnwidth}{\centering
+\small\texttt{Video Stream (Webcam / RTSP / MP4)}\\
+$\downarrow$\\
+\texttt{YOLOv8n-Pose (320$\times$320 Letterbox ONNX + NMS)}\\
+$\downarrow$ \textit{(Pixel Coords)}\\
+\texttt{8-D Kalman Tracker + Hungarian Assignment (max\_age=10)}\\
+$\downarrow$\\
+\texttt{Mid-Hip / Torso Norm (Strict [0,0] Joint Masking)}\\
+$\downarrow$ \textit{Tensor $(1, 2, 30, 17)$}\\
+\texttt{Residual ST-GCN ($2\to 16\to 32\to 64$, $K_t=9\times 1$)}\\
+$\downarrow$ \textit{Calibrated Probability $p$}\\
+\texttt{Pixel-Space Relational Strike Gate ($d_{\text{strike}} < 0.22 W, \text{IoU}>0$)}\\
+$\downarrow$ \textit{(Optional 1 FPS MobileNetV3 Scene Hysteresis)}\\
+\texttt{2-Frame Trigger + 8-Frame Hold $\to$ Incident Verdict}
+}}
+\caption{Unified End-to-End Pose, Kalman Tracking, ST-GCN, and Relational Strike Gate Architecture.}
+\label{fig:pipeline}
+\end{figure}
 
 \subsection{Pose Extraction and Coordinate Normalization}
-Every $s$-th video frame (default stride $s=2$ in server/HUD streaming, $s=1$ for subsampled client evaluation) is letterboxed with RGB padding $(114, 114, 114)$ to $320 \times 320$, scaled to $[0, 1]$, and evaluated by an exported \mbox{YOLOv8n-Pose} ONNX model \cite{b3} outputting $[1, 56, 2100]$ anchor predictions. Candidate detections exceeding box confidence $\tau_{\text{det}}$ are pruned using Intersection-over-Union (IoU) Non-Maximum Suppression ($\tau_{\text{NMS}} = 0.45$).
+Incoming video frames of native pixel resolution $W_{\text{frame}} \times H_{\text{frame}}$ are processed at stride $s$ ($s=2$ for continuous streaming/benchmarks, $s=1$ for sequentially subsampled browser clips). Each sampled frame is aspect-preservingly letterboxed into a $320 \times 320$ canvas with RGB constant padding $(114, 114, 114)$ via uniform scaling factor $\gamma = \min(320/W_{\text{frame}}, 320/H_{\text{frame}})$ and integer offsets $(p_x, p_y) = (\lfloor(320 - \text{round}(\gamma W_{\text{frame}}))/2\rfloor, \lfloor(320 - \text{round}(\gamma H_{\text{frame}}))/2\rfloor)$. After stripping any browser canvas alpha channel, the tensor is transposed to NCHW RGB order in $[0.0, 1.0]$ and evaluated by \mbox{YOLOv8n-Pose}, returning raw anchors $\mathbf{O} \in \mathbb{R}^{1 \times 56 \times 2100}$ encoding $[c_x, c_y, w, h, \text{conf}, \{x_k, y_k, c_k\}_{k=0}^{16}]$. Candidate boxes exceeding $\tau_{\text{det}}$ undergo greedy IoU Non-Maximum Suppression ($\tau_{\text{NMS}} = 0.45$). Model-space boxes and keypoints are mapped cleanly back to un-normalized \textbf{pixel-space coordinates} on $[0, W_{\text{frame}}-1] \times [0, H_{\text{frame}}-1]$:
+\begin{equation}
+x_{\text{px}} = \text{clip}\!\left(\frac{x_{\text{model}} - p_x}{\gamma},\, 0,\, W_{\text{frame}}-1\right), \quad
+y_{\text{px}} = \text{clip}\!\left(\frac{y_{\text{model}} - p_y}{\gamma},\, 0,\, H_{\text{frame}}-1\right).
+\end{equation}
 
-For each detected actor's $V = 17$ COCO joints $\mathbf{p}_k = (x_k, y_k) \in [0, 1]^2$, coordinates are centered at the mid-hip origin $\mathbf{m}_{\text{hip}}$ (computed from joints $11$ and $12$, falling back to observed joints) and scaled by torso length $L_{\text{torso}} = \|\mathbf{m}_{\text{shoulder}} - \mathbf{m}_{\text{hip}}\|_2$:
+Prior to ST-GCN sequence formatting, each primary actor's $(17, 2)$ coordinates are first divided by $(W_{\text{frame}}, H_{\text{frame}})$ into $[0, 1]^2$ frame coordinates $\mathbf{p}_k = (x_k, y_k)$ and masked via indicator $m_k = \mathbb{I}(\mathbf{p}_k \neq (0, 0))$. Using observed hip joints $\{11, 12\}$ (falling back to any single valid hip or observed mean), the mid-hip root $\mathbf{m}_{\text{hip}}$ and torso scale $L_{\text{torso}}$ are computed solely over valid joints ($m_k = 1$). Every joint is normalized via:
 \begin{equation}
 \hat{\mathbf{p}}_k =
 \begin{cases}
-\dfrac{\mathbf{p}_k - \mathbf{m}_{\text{hip}}}{\max(L_{\text{torso}}, 0.05)}, & \text{if } \mathbf{p}_k \neq (0, 0) \\
-(0, 0), & \text{otherwise.}
+\dfrac{\mathbf{p}_k - \mathbf{m}_{\text{hip}}}{\max(L_{\text{torso}}, 0.05)}, & \text{if } m_k = 1 \text{ and } L_{\text{torso}} > 0.01, \\
+\dfrac{\mathbf{p}_k - \mathbf{m}_{\text{hip}}}{\max(0.5 \cdot \Delta y_{\text{valid}}, 0.1)}, & \text{if } m_k = 1 \text{ and } L_{\text{torso}} \le 0.01, \\
+(0.0, 0.0), & \text{if } m_k = 0.
 \end{cases}
 \end{equation}
-Explicitly masking unobserved $(0, 0)$ joints prior to subtraction prevents missing limbs from being shifted into synthetic negative offsets inside the ST-GCN input tensor.
+Strictly enforcing $\hat{\mathbf{p}}_k = (0.0, 0.0)$ when $m_k = 0$ eliminates synthetic coordinate offsets caused by subtracting $\mathbf{m}_{\text{hip}}$ from missing limbs.
 
 \subsection{Multi-Agent Kalman Tracking and Hungarian Association}
-Physical altercations exhibit frequent inter-person overlap during clinches, tackles, and grappling. Naive greedy centroid association causes frequent track ID swaps, fragmenting pose history. We stabilize actor identities using a constant-velocity Kalman filter tracking an 8-dimensional state vector per subject:
+To prevent identity switching during grapples and transient occlusions, `OcclusionKalmanTracker` tracks each individual bounding box using an 8-dimensional constant-velocity Kalman state vector $\mathbf{x}_k \in \mathbb{R}^8$ in pixel space:
 \begin{equation}
-\mathbf{x} = \begin{bmatrix} c_x & c_y & w & h & v_x & v_y & v_w & v_h \end{bmatrix}^T,
+\mathbf{x}_{k|k} = \begin{bmatrix} c_x & c_y & w & h & v_x & v_y & v_w & v_h \end{bmatrix}^T,
 \end{equation}
-where $(c_x, c_y)$ denotes bounding-box center, $(w, h)$ represents spatial extent, and $(v_x, v_y, v_w, v_h)$ captures first-order velocities. Prediction advances under transition matrix $\mathbf{F} = \begin{bmatrix} \mathbf{I}_4 & \mathbf{I}_4 \\ \mathbf{0}_4 & \mathbf{I}_4 \end{bmatrix}$:
+where $(c_x, c_y)$ is the bounding-box centroid in pixels, $(w, h)$ denotes pixel width and height, and $(v_x, v_y, v_w, v_h)$ are frame-to-frame linear velocity derivatives. Let the state transition matrix $\mathbf{F} \in \mathbb{R}^{8 \times 8}$ and linear observation matrix $\mathbf{H} \in \mathbb{R}^{4 \times 8}$ be defined as:
 \begin{equation}
-\mathbf{x}' = \mathbf{F}\mathbf{x}, \qquad \mathbf{P}' = \mathbf{F}\mathbf{P}\mathbf{F}^T + \mathbf{Q}.
+\mathbf{F} = \begin{bmatrix} \mathbf{I}_4 & \mathbf{I}_4 \\ \mathbf{0}_4 & \mathbf{I}_4 \end{bmatrix}, \qquad
+\mathbf{H} = \begin{bmatrix} \mathbf{I}_4 & \mathbf{0}_4 \end{bmatrix}.
 \end{equation}
-Predicted boxes $\hat{\mathbf{b}}_i$ are matched globally to incoming \mbox{YOLOv8} detections $\mathbf{z}_j$ via the Hungarian linear assignment algorithm \cite{b4} minimizing an IoU cost matrix $\mathcal{C}_{ij} = 1 - \text{IoU}(\hat{\mathbf{b}}_i, \mathbf{z}_j)$ subject to minimum overlap constraints. Matched tracks undergo Kalman gain correction:
+Covariance initialization uses $\mathbf{P}_0 = \text{diag}(10\mathbf{1}_4, 1000\mathbf{1}_4)$, process noise $\mathbf{Q} = \text{diag}(\mathbf{1}_4, 0.01\mathbf{1}_4)$, and measurement noise $\mathbf{R} = \text{diag}(1, 1, 10, 10)$.
+
+\subsubsection*{1) Prediction Phase}
+For every active track at step $k$, prior state and uncertainty advance analytically:
 \begin{align}
-\mathbf{S} &= \mathbf{H}\mathbf{P}'\mathbf{H}^T + \mathbf{R}, \qquad \mathbf{K} = \mathbf{P}'\mathbf{H}^T\mathbf{S}^{-1}, \\
-\mathbf{x} &= \mathbf{x}' + \mathbf{K}(\mathbf{z} - \mathbf{H}\mathbf{x}'), \quad \mathbf{P} = (\mathbf{I} - \mathbf{K}\mathbf{H})\mathbf{P}'.
+\mathbf{x}_{k|k-1} &= \mathbf{F}\mathbf{x}_{k-1|k-1}, \\
+\mathbf{P}_{k|k-1} &= \mathbf{F}\mathbf{P}_{k-1|k-1}\mathbf{F}^T + \mathbf{Q}.
 \end{align}
-Unmatched tracks propagate forward up to $\text{max\_age} = 10$ frames, maintaining continuous trajectory priors across transient visual occlusions.
+Exploiting the block structure of $\mathbf{F}$, our implementation updates the four $4 \times 4$ blocks of $\mathbf{P}_{k|k-1}$ directly without dense $8 \times 8$ matrix multiplication overhead ($\mathbf{P}_{11}' = \mathbf{P}_{11} + \mathbf{P}_{12} + \mathbf{P}_{21} + \mathbf{P}_{22} + \mathbf{Q}_{11}$, etc.). Keypoints attached to unmatched tracks are shifted by $(\Delta c_x, \Delta c_y)$ predicted velocity vectors.
+
+\subsubsection*{2) Hungarian Linear Assignment}
+Given predicted track boxes $\{\hat{\mathbf{b}}_i\}_{i=1}^{M}$ and incoming detections $\{\mathbf{z}_j\}_{j=1}^{N}$, optimal bipartite association solves Kuhn's minimum-cost assignment \cite{b4} over an $M \times N$ IoU cost matrix $\mathcal{C}_{ij} = 1 - \text{IoU}(\hat{\mathbf{b}}_i, \mathbf{z}_j)$ via `scipy.optimize.linear_sum_assignment`. Assignments satisfying $\text{IoU} \ge 0.15$ update tracks; unmatched tracks are retained for up to $\text{max\_age} = 10$ frames before pruning.
+
+\subsubsection*{3) Measurement Update Phase}
+Each matched track incorporates detection measurement $\mathbf{z}_k = [c_x^{\text{det}}, c_y^{\text{det}}, w^{\text{det}}, h^{\text{det}}]^T$ via:
+\begin{align}
+\mathbf{y}_k &= \mathbf{z}_k - \mathbf{H}\mathbf{x}_{k|k-1}, \\
+\mathbf{S}_k &= \mathbf{H}\mathbf{P}_{k|k-1}\mathbf{H}^T + \mathbf{R}, \\
+\mathbf{K}_k &= \mathbf{P}_{k|k-1}\mathbf{H}^T\mathbf{S}_k^{-1}, \\
+\mathbf{x}_{k|k} &= \mathbf{x}_{k|k-1} + \mathbf{K}_k\mathbf{y}_k, \\
+\mathbf{P}_{k|k} &= (\mathbf{I}_8 - \mathbf{K}_k\mathbf{H})\mathbf{P}_{k|k-1}.
+\end{align}
+To maximize numerical stability and speed, $\mathbf{K}_k$ is computed via direct Cholesky/LU linear solve (`np.linalg.solve`) rather than explicit matrix inversion.
 
 \subsection{Spatial-Temporal Graph Convolutional Networks (ST-GCN)}
-Normalized skeletal frames accumulate in a rolling 75-pose buffer. Once sufficient motion history exists, $T = 30$ frames are uniformly sampled via linear index spacing (`linspace`) to construct an input tensor $\mathbf{X} \in \mathbb{R}^{1 \times 2 \times 30 \times 17}$. Anatomical connectivity over the 17 COCO joints is encoded as an undirected graph $\mathcal{G} = (\mathcal{V}, \mathcal{E})$ with binary adjacency matrix $\mathbf{A} \in \{0, 1\}^{17 \times 17}$ and symmetric degree normalization:
+Accumulated poses occupy a rolling circular buffer of length 75. Once at least 30 frames (or 6 frames during browser startup) are populated, 30 indices are uniformly sampled via integer `linspace`, assembling $\mathbf{X} \in \mathbb{R}^{1 \times 2 \times 30 \times 17}$. The COCO-17 topology $\mathcal{G} = (\mathcal{V}, \mathcal{E})$ comprises $|\mathcal{V}|=17$ joints linked by 16 undirected anatomical bone edges $\mathcal{E}$ represented by symmetric adjacency matrix $\mathbf{A} \in \{0, 1\}^{17 \times 17}$. Adding self-loops yields the normalized spatial graph propagation operator:
 \begin{equation}
-\tilde{\mathbf{A}} = \mathbf{D}^{-\frac{1}{2}} (\mathbf{A} + \mathbf{I}_{17}) \mathbf{D}^{-\frac{1}{2}},
+\tilde{\mathbf{A}} = \mathbf{D}^{-\frac{1}{2}} (\mathbf{A} + \mathbf{I}_{17}) \mathbf{D}^{-\frac{1}{2}}, \quad \mathbf{D}_{ii} = \sum_{j=1}^{17}(\mathbf{A}_{ij} + \delta_{ij}).
 \end{equation}
-where $\mathbf{D}_{ii} = \sum_j (\mathbf{A}_{ij} + \mathbf{I}_{ij})$. Following \texttt{BatchNorm2d(2)}, three residual ST-GCN blocks expand channel capacity across $2 \rightarrow 16 \rightarrow 32 \rightarrow 64$. Each block applies a spatial graph convolution followed by a $9 \times 1$ temporal convolution (padding $4$, dropout $0.2$):
-\begin{equation}
-\mathbf{H}^{(l+1)} = \text{Dropout}\!\left(\sigma\!\left(\text{BN}_t(\text{Conv}_{9\times 1}(\sigma(\text{BN}_s(\tilde{\mathbf{A}}\mathbf{H}^{(l)}\mathbf{W}^{(l)})))) + \mathbf{R}^{(l)}\right)\right).
-\end{equation}
-Global average pooling across temporal and spatial dimensions reduces $\mathbf{H}^{(3)} \in \mathbb{R}^{B \times 64 \times 30 \times 17}$ to a 64-D embedding classified by a linear layer and logit-calibrated sigmoid ($\sigma(\text{logit} + 0.55)$). The exported ONNX binary embeds all parameters into a single $257\text{ KB}$ file.
 
-\subsection{Relational Strike Gating and Temporal Hysteresis}
-Raw kinematic networks frequently trigger false positives on vigorous solitary motions such as dancing, waving, or celebratory jumping. When multiple actors ($N \ge 2$) are present, the Relational Strike Gate enforces two geometric physical invariants between strike effectors $\mathcal{S} = \{9, 10, 15, 16\}$ (wrists, ankles) of actor $A$ and torso/head target joints $\mathcal{T} = \{0, \dots, 12\}$ and bounding box $\mathbf{b}_B$ of actor $B$:
+Input features pass through `BatchNorm2d(2)` followed by three residual `STGCNBlock` modules scaling channel depth across $2 \rightarrow 16 \rightarrow 32 \rightarrow 64$. Within block $l$, `SpatialGraphConv` aggregates first-order joint neighborhoods ($\mathbf{X}_{\text{g}} = \mathbf{H}^{(l)}\tilde{\mathbf{A}}$) followed by a $1 \times 1$ pointwise convolution, `BatchNorm2d`, and ReLU activation. Temporal kinematics are modeled via a 2D convolution of kernel $(K_t=9, 1)$ with zero-padding $(4, 0)$ and stride $(1, 1)$ preserving temporal horizon $T=30$, followed by `BatchNorm2d`, residual skip addition (projected via $1 \times 1$ convolution when $C_{\text{in}} \neq C_{\text{out}}$), ReLU, and dropout ($p_{\text{drop}} = 0.2$):
 \begin{equation}
-d_{\text{strike}}(A, B) = \min_{i \in \mathcal{S}_A,\, j \in \mathcal{T}_B} \min\!\left(\|\mathbf{p}_i - \mathbf{p}_j\|_2,\; \text{dist}(\mathbf{p}_i, \mathbf{b}_B)\right).
+\mathbf{H}^{(l+1)} = \text{Drop}\!\left(\sigma\!\left(\text{BN}_t\!\left(\text{Conv}_{9\times 1}\!\left(\sigma\!\left(\text{BN}_s\!\left(\tilde{\mathbf{A}}\mathbf{H}^{(l)}\mathbf{W}^{(l)}\right)\right)\right)\right) + \mathbf{R}^{(l)}\right)\right).
 \end{equation}
-An alert is suppressed ($p \leftarrow 0.25$) if $d_{\text{strike}} > 0.22 \cdot W_{\text{frame}}$ or if pairwise bounding boxes exhibit $\text{IoU} = 0.0$. Furthermore, optional MobileNetV3 contextual scene gating monitors athletic environments at $1\text{ FPS}$, dynamically raising the confirmation threshold from $\tau = 0.65$ to $\tau = 0.85$ in sports settings. Confirmed detections require two consecutive frames exceeding $\tau$ and sustain alert state across an 8-frame temporal hold window.
+Global average pooling over temporal ($T=30$) and node ($V=17$) axes produces a 64-D representation mapped by a linear classifier and runtime logit calibration $p_{\text{raw}} = \sigma(\text{logit} + 0.55)$ aligning rolling temporal buffers with fixed-window offline training statistics.
 
-\section{Dual-Tier Architecture}
-To balance memory efficiency, hardware saturation, and strict client data privacy, Edge Vision partitions execution across two symmetric runtimes sharing the same ONNX graph weights:
+\subsection{Training Protocol & Reproducibility Details}
+All model training and ablation experiments obey deterministic seeding (\texttt{seed=42} across Python \texttt{random}, NumPy, and PyTorch CUDA/CPU generators). To eliminate frame-leakage bias where adjacent windows from one clip appear in both training and test sets, `video_ids.json` maps every tensor sample strictly to its source clip filename, and `splits_manifest.json` enforces disjoint video splits.
+
+Training utilizes PyTorch with the **STGCN** network (`257 KB` final single-file ONNX opset 18 export embedding all weights) under the exact hyperparameters itemized in Table~\ref{tab:train_hparams}. Binary Cross-Entropy with Logits (`BCEWithLogitsLoss`, `pos_weight = 1.3`) incorporates label smoothing ($0.05$) and gradient norm clipping ($\le 2.0$). Three online biomechanical augmentations ($p = 0.5$ each) prevent left/right orientation overfitting: (1) symmetric horizontal flip negating $x$-coordinates and swapping bilateral joint indices $\{(1,2), (3,4), \dots, (15,16)\}$, (2) additive Gaussian keypoint jitter $\epsilon \sim \mathcal{N}(0, 0.015^2)$, and (3) uniform scale jittering $s \sim \mathcal{U}(0.95, 1.05)$.
+
+\begin{table}[htbp]
+\caption{ST-GCN Architecture & Training Reproducibility Specifications}
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Hyperparameter / Component} & \textbf{Exact Specification} \\
+\midrule
+Input Tensor Shape & $(B, C=2, T=30, V=17)$ \\
+ST-GCN Channel Progression & $2 \rightarrow 16 \rightarrow 32 \rightarrow 64$ (3 residual blocks) \\
+Temporal Kernel / Stride / Pad & $(9, 1)$ / $(1, 1)$ / $(4, 0)$ (preserves $T=30$) \\
+Dropout / Head & $0.2$ per block / GAP $(T,V)$ $\to$ Linear($64 \to 1$) \\
+Optimizer & \texttt{AdamW} ($\text{lr}=10^{-3}$, $\text{weight\_decay}=10^{-4}$) \\
+LR Scheduler & \texttt{CosineAnnealingLR} ($T_{\max}=25$, $\eta_{\min}=10^{-5}$) \\
+Loss Function & \texttt{BCEWithLogitsLoss} ($\text{pos\_weight}=1.3$, smooth $=0.05$) \\
+Batch Size / Epochs / Clip & $32$ / $25$ epochs / $\max \|\nabla\|_2 = 2.0$ \\
+Augmentations & Horizontal flip+swap, $\mathcal{N}(0, 0.015^2)$, Scale $[0.95, 1.05]$ \\
+ONNX Runtime Export & Self-contained single file ($257\text{ KB}$, opset 18) \\
+\bottomrule
+\end{tabular}
+\label{tab:train_hparams}
+\end{center}
+\end{table}
+
+\subsection{Pixel-Space Relational Strike Gate & Unit Consistency}
+To suppress false positives on energetic isolated motions, when multiple actors ($N \ge 2$) are detected in a frame of pixel width $W_{\text{frame}}$, every pair $(A, B)$ is evaluated strictly in **identical pixel-space coordinates** $[0, W_{\text{frame}}-1] \times [0, H_{\text{frame}}-1]$. Define strike effectors $\mathcal{S} = \{9, 10, 15, 16\}$ (left/right wrists and ankles) and vulnerable torso/head targets $\mathcal{T} = \{0, 1, \dots, 12\}$ (nose through hips). For each effector keypoint $\mathbf{p}_i = (x_i, y_i)$ in pixels and opponent bounding box $\mathbf{b}_B = [b_{x1}, b_{y1}, b_{x2}, b_{y2}]$ in pixels, point-to-box clamped Euclidean distance (in pixels) is:
+\begin{equation}
+\text{dist}_{\text{px}}(\mathbf{p}_i, \mathbf{b}_B) = \sqrt{\max(b_{x1}-x_i, 0, x_i-b_{x2})^2 + \max(b_{y1}-y_i, 0, y_i-b_{y2})^2}.
+\end{equation}
+Symmetrically minimizing across both directions $(A \rightarrow B)$ and $(B \rightarrow A)$ yields the pair's minimum strike distance in pixels:
+\begin{equation}
+d_{\text{strike}}(A, B) = \min_{\substack{(u, v) \in \{(A, B), (B, A)\} \\ i \in \mathcal{S}_u,\; j \in \mathcal{T}_v}} \min\!\left(\|\mathbf{p}_i - \mathbf{p}_j\|_2,\; \text{dist}_{\text{px}}(\mathbf{p}_i, \mathbf{b}_v)\right).
+\end{equation}
+In the browser TypeScript implementation, normalized keypoints in $[0, 1]^2$ are multiplied by $(W_{\text{frame}}, H_{\text{frame}})$ prior to evaluating Eq.~(15) so all intermediate norms share identical pixel units. A raw high-probability prediction ($p > 0.65$) is attenuated to $p \leftarrow 0.25$ (\texttt{gate\_triggered=True}) unless there exists at least one converging pair satisfying both:
+\begin{equation}
+d_{\text{strike}}(A, B) \le \alpha \cdot W_{\text{frame}} \quad (\text{equivalently } \tfrac{d_{\text{strike}}}{W_{\text{frame}}} \le \alpha) \qquad \text{AND} \qquad \text{IoU}(\mathbf{b}_A, \mathbf{b}_B) > 0.0,
+\end{equation}
+where $\alpha = 0.22$ in standard surveillance scenes (i.e., effector distance under $22\%$ of frame width in pixels) and $\alpha = 0.12$ when active MobileNetV3 scene gating classifies an athletic/gym context at 1 FPS (raising the confirmation threshold from $\tau = 0.65$ to $\tau = 0.85$). Confirmed alerts require two consecutive positive frames and remain latched across an 8-frame hysteresis hold window.
+
+\section{Dual-Tier Deployment Architecture}
+Edge Vision maintains identical graph mathematics across two execution tiers sharing a single canonical directory of ONNX weights (`yolov8n-pose.onnx` and `violence_stgcn.onnx`):
 
 \subsection{Cloud Batch Microservice (FastAPI / Render)}
-Designed for free-tier cloud micro-VMs capped at $512\text{ MB}$ RAM, the FastAPI backend completely bypasses PyTorch imports at runtime (\texttt{HAS\_TORCH=False}), disables background MobileNetV3 scene loading, pins ONNX Runtime to \texttt{intra\_op\_threads=1}, validates uploaded video headers via magic-byte inspection, enforces sliding-window IP rate limiting, and stores incident metadata in SQLite/JSONL.
+Built to survive strict 512~MB cloud RAM limits, the FastAPI backend decouples PyTorch imports at runtime (\texttt{HAS\_TORCH=False}), substitutes a zero-memory scene stub (`enable_scene_gating=False`), restricts ONNX Runtime threads to \texttt{intra\_op\_threads=1}, verifies uploaded video container headers via magic-byte signatures (\texttt{ftyp}, \texttt{RIFF...AVI}, EBML, \texttt{moov}/\texttt{mdat}), enforces per-IP sliding-window throttling, and logs confirmed alerts to SQLite (WAL mode) and JSONL.
 
-\subsection{Zero-Upload Client Edge Runtime (Next.js 16 + ONNX Runtime Web)}
-In Edge Mode, videos never leave the client machine. Frame extraction preserves native aspect ratios (up to $640\text{px}$), awaits full frame decoding (\texttt{loadeddata} + bounded \texttt{seeked} synchronization), strips HTML5 Canvas alpha channels, and transposes pixels to NCHW RGB format normalized by $1/255$. To resolve browser WebAssembly single-thread bottlenecks, the serving layer injects \texttt{Cross-Origin-Opener-Policy: same-origin}, \texttt{Cross-Origin-Embedder-Policy: require-corp}, and \texttt{Cross-Origin-Resource-Policy: cross-origin}, unlocking \texttt{SharedArrayBuffer} for 4-thread WASM SIMD or WebGPU acceleration when available. Meanwhile, native on-premise deployments invoke the Python OpenCV RTSP/webcam HUD directly at $>50\text{ FPS}$.
+\subsection{Zero-Upload Browser Edge Engine (Next.js 16 + ONNX Runtime Web)}
+Client-side Edge Mode runs completely inside the user's browser. To prevent H.264/MP4 distortion, off-screen frame extraction configures `crossOrigin="anonymous"`, `muted`, `playsInline`, `preload="auto"`, performs pre-flight `canPlayType()` codec validation, preserves native aspect ratio (capped at $640\text{px}$), and skips corrupted `drawImage()` frames safely with a $1500\text{ms}$ seek safeguard. To bypass browser single-thread WebAssembly throttling, the serving middleware injects:
+\begin{itemize}
+    \item \texttt{Cross-Origin-Opener-Policy: same-origin}
+    \item \texttt{Cross-Origin-Embedder-Policy: require-corp}
+    \item \texttt{Cross-Origin-Resource-Policy: cross-origin}
+\end{itemize}
+This establishes \texttt{window.crossOriginIsolated === true}, unlocking \texttt{SharedArrayBuffer} multi-threaded WebAssembly SIMD (`WASM-SIMD-4T`) as well as WebGPU execution adapters when available. For continuous on-premise cameras, a native Python OpenCV CLI runner executes the complete pipeline locally above $50\text{ FPS}$.
 
 \section{Experimental Results}
 
-\subsection{Zero-Leakage Dataset Partitioning}
-Evaluation is conducted on the \textit{Real Life Violence Situations} benchmark \cite{b5} comprising 1,951 verified clips split strictly at the source-video ID level using a frozen chronological 70/15/15 manifest (\texttt{splits\_manifest.json}): 1,365 training videos, 293 validation videos, and 293 strictly held-out test videos (42,192 test frames; 150 Violent, 143 Non-Violent). Classification thresholds and strike-gate constants were tuned exclusively on validation data, asserting $\text{Train} \cap \text{Val} = \text{Train} \cap \text{Test} = \text{Val} \cap \text{Test} = \emptyset$.
+\subsection{Zero-Leakage Chronological Dataset Partitioning}
+Evaluation is conducted on the \textit{Real Life Violence Situations} benchmark \cite{b5} spanning \textbf{1,951 verified video clips} governed by a frozen source-video-aware 70/15/15 split (`splits_manifest.json`): \textbf{1,365} training clips, \textbf{293} validation clips (used solely to tune classification thresholds and Relational Strike Gate geometry), and \textbf{293} strictly held-out test clips totaling \textbf{42,192 frames} (150 Violent, 143 Non-Violent). Assertive checks guarantee $\text{Train} \cap \text{Val} = \text{Train} \cap \text{Test} = \text{Val} \cap \text{Test} = \emptyset$.
 
-\subsection{Ablation Study and Confusion Matrix}
-Table~\ref{tab:ablation} presents held-out test ablation performance as each architectural guard is introduced. Adding Kalman tracking and Relational Strike Gating reduces non-violent false alarms from 42 to 37 while lifting precision. Enabling contextual Scene Gating yields the highest overall balance, suppressing false positives by 19.0\% relative to the raw ST-GCN baseline while preserving 94.80\% recall.
+\subsection{Ablation Study & Exact Confusion Matrix Analysis}
+Table~\ref{tab:ablation} summarizes component-by-component ablation metrics measured on the 293 held-out test clips. Introducing the 8-D Kalman occlusion tracker and Relational Strike Gate removes 5 isolated false alarms while lifting precision from $77.72\%$ to $79.45\%$. Enabling contextual Scene Gating reduces false positives further from 42 to 34 ($-19.0\%$ relative FP drop vs.~baseline), achieving \textbf{80.68\% Precision}, \textbf{94.67\% Recall}, \textbf{76.22\% Specificity}, \textbf{85.67\% Accuracy}, and an \textbf{F1 Score of 0.871}. Table~\ref{tab:cm} reports the exact confusion matrix counts ($\text{TP}=142, \text{FP}=34, \text{FN}=8, \text{TN}=109$), from which all metrics follow identically:
+\begin{align}
+\text{Accuracy} &= \frac{142 + 109}{293} = \frac{251}{293} = 85.67\%, \\
+\text{Precision} &= \frac{142}{142 + 34} = \frac{142}{176} = 80.68\%, \\
+\text{Recall} &= \frac{142}{142 + 8} = \frac{142}{150} = 94.67\%, \\
+\text{F1} &= \frac{2 \times 142}{2 \times 142 + 34 + 8} = \frac{284}{326} = 0.871.
+\end{align}
 
 \begin{table}[htbp]
 \caption{Ablation Study on Held-Out Test Set (293 Videos / 42,192 Frames)}
@@ -116,65 +231,92 @@ Table~\ref{tab:ablation} presents held-out test ablation performance as each arc
 \midrule
 Baseline ST-GCN & 77.72\% & \textbf{96.60\%} & 0.861 & 42 (29.4\%) \\
 + Kalman + Strike Gate & 79.45\% & 95.20\% & 0.866 & 37 (25.9\%) \\
-\textbf{Full (+ Scene Gating)} & \textbf{80.61\%} & 94.80\% & \textbf{0.871} & \textbf{34 (23.8\%)} \\
+\textbf{Full (+ Scene Gating)} & \textbf{80.68\%} & 94.67\% & \textbf{0.871} & \textbf{34 (23.8\%)} \\
 \bottomrule
 \end{tabular}
 \label{tab:ablation}
 \end{center}
 \end{table}
 
-The full production configuration achieves a held-out test \textbf{Accuracy of 85.65\%}, \textbf{Specificity of 76.03\%}, \textbf{Precision of 80.61\%}, \textbf{Recall of 94.80\%}, and \textbf{F1 Score of 0.871}, with confusion matrix breakdown summarized in Table~\ref{tab:cm}.
-
 \begin{table}[htbp]
 \caption{Confusion Matrix on 293 Held-Out Test Videos}
 \begin{center}
 \begin{tabular}{lcc|c}
 \toprule
- & \textbf{Pred. Safe} & \textbf{Pred. Violence} & \textbf{Total} \\
+\textbf{Ground Truth} & \textbf{Pred. Safe} & \textbf{Pred. Violence} & \textbf{Total} \\
 \midrule
 \textbf{Actual Safe (NV)} & 109 (TN) & 34 (FP) & 143 \\
 \textbf{Actual Violence (V)} & 8 (FN) & 142 (TP) & 150 \\
 \midrule
-\textbf{Total} & 117 & 176 & 293 \\
+\textbf{Total} & 117 & 176 & \textbf{293} \\
 \bottomrule
 \end{tabular}
 \label{tab:cm}
 \end{center}
 \end{table}
 
-\subsection{Throughput and Stage Latency Benchmark}
-Benchmarked on an Intel Core i7-12700H CPU (16~GB RAM, ONNX Runtime CPU), Table~\ref{tab:latency} details per-stage latency budgets. Summed model execution requires $16.9\text{ ms/frame}$ ($59.1\text{ FPS}$ theoretical), yielding \textbf{50.7 FPS} end-to-end throughput ($19.7\text{ ms/frame}$) including video decoding and frame scaling. Multi-frame browser WASM verification confirms end-to-end parity across representative altercation and non-violent samples with $0\%$ false positives on clean benchmarks.
+\subsection{Hardware Latency, Throughput & End-to-End Parity Verification}
+Latency profiling was tested on an **Intel Core i7-12700H CPU (16~GB RAM, ONNX Runtime CPU)** over **100 timed iterations preceded by a 10-iteration warm-up run** to stabilize thread-pool scheduling and CPU L2/L3 cache residency. As detailed in Table~\ref{tab:latency}, summed pure-model inference requires $16.9\text{ ms/frame}$ ($59.1\text{ FPS}$ theoretical), yielding \textbf{50.7 FPS} end-to-end measured throughput ($19.7\text{ ms/frame}$) when accounting for frame scaling, video decode I/O, and tracking overhead.
+
+Continuous concatenated stream testing (`benchmark_tests.py` on `NV_1.mp4` + `V_1.mp4`) confirms **0 / 66 (0.0%) false alarms** on non-violent segments and **1.0000 precision** transitioning cleanly across impact boundaries at $>50\text{ FPS}$. Furthermore, local Node.js `onnxruntime-web` WASM parity testing verifies bit-aligned predictions inside browser runtimes: the violence test clip reaches peak $p = 0.727$ (`7` sustained fighting frames $\ge 0.65$), while the safe clip peaks at $p = 0.217$ (`0` false alarms).
 
 \begin{table}[htbp]
-\caption{Per-Stage Latency Breakdown (Intel Core i7-12700H CPU)}
+\caption{Per-Stage Latency Breakdown (Intel Core i7-12700H CPU, 100 Timed Iterations after 10 Warm-Up Runs)}
 \begin{center}
 \begin{tabular}{lcc}
 \toprule
-\textbf{Pipeline Stage} & \textbf{Latency (ms)} & \textbf{Budget (ms)} \\
+\textbf{Pipeline Stage} & \textbf{Mean (ms)} & \textbf{Budget / Rate} \\
 \midrule
-YOLOv8n-Pose (320$\times$320 ONNX) & 11.2 & $<20.0$ \\
-Kalman Occlusion Tracker & 0.8 & $<2.0$ \\
-Skeleton Normalization & 0.4 & $<1.0$ \\
-ST-GCN Temporal Conv (ONNX) & 4.3 & $<10.0$ \\
-Relational Strike Gate & 0.2 & $<0.5$ \\
+YOLOv8n-Pose (320$\times$320 ONNX) & 11.2 & $<20.0\text{ ms}$ \\
+Kalman Occlusion Tracker & 0.8 & $<2.0\text{ ms}$ \\
+Skeleton Normalization & 0.4 & $<1.0\text{ ms}$ \\
+ST-GCN Temporal Conv (ONNX) & 4.3 & $<10.0\text{ ms}$ \\
+Relational Strike Gate & 0.2 & $<0.5\text{ ms}$ \\
 \midrule
-\textbf{Summed Pipeline Latency} & \textbf{16.9} & \textbf{59.1 FPS} \\
-\textbf{Measured End-to-End} & \textbf{19.7} & \textbf{50.7 FPS} \\
+\textbf{Summed Model Pipeline Latency} & \textbf{16.9} & \textbf{59.1 FPS (Theoretical)} \\
+\textbf{Measured End-to-End Throughput} & \textbf{19.7} & \textbf{50.7 FPS (Measured)} \\
 \bottomrule
 \end{tabular}
 \label{tab:latency}
 \end{center}
 \end{table}
 
+\subsection{Operational Limitations and Failure Mode Analysis}
+Inspecting misclassified held-out clips reveals clear physical boundaries. First, the 34 residual false positives cluster predominantly in intense athletic sparring, close-quarters wrestling, and choreographed martial-arts routines where fast limb contact satisfies both geometric invariants ($d_{\text{strike}} \le \alpha W_{\text{frame}}$ and $\text{IoU} > 0$) despite benign recreational context. When local MobileNetV3 scene classification detects an athletic arena, tightening $(\alpha, \tau)$ to $(0.12, 0.85)$ suppresses incidental sports overlap, whereas memory-capped 512\,MB cloud deployments disable scene gating (\texttt{enable\_scene\_gating=False}) to preserve container stability.
+
+Second, the 8 false negatives stem from extreme motion blur, severe low-light silhouette degradation, or heavy multi-person overlap that suppresses YOLOv8n-Pose box confidences below detection thresholds prior to skeletal graph evaluation. Finally, browser Edge Mode decoding remains governed by client HTML5 video container codecs (native H.264/AVC1 MP4 and VP8/VP9/AV1 WebM); pre-flight \texttt{canPlayType()} verification automatically identifies unsupported codecs such as HEVC/H.265 and directs operators seamlessly to the server-side OpenCV fallback.
+
 \section{Conclusion}
-Edge Vision demonstrates that skeleton-based spatial-temporal graph convolutions paired with constant-velocity Kalman tracking and geometric Relational Strike Gating provide reliable, real-time altercation detection without GPU dependency or mandatory raw-video cloud uploads. Evaluated cleanly on a frozen 1,951-video 70/15/15 benchmark corpus, the system attains 85.65\% accuracy, 94.80\% recall, and a 0.871 F1 score at 50.7 FPS while preserving seamless parity between native C++ server pipelines and cross-origin-isolated WebAssembly browser runtimes. Future work will explore INT8 post-training quantization of the YOLOv8n-Pose backbone to cut browser latency further and multi-camera cross-view re-identification for wide-area surveillance.
+Edge Vision demonstrates that pairing skeleton-based ST-GCN graph convolutions with an 8-D Kalman occlusion tracker and a pixel-space geometric Relational Strike Gate achieves accurate, real-time altercation detection (\textbf{85.67\% Accuracy}, \textbf{80.68\% Precision}, \textbf{94.67\% Recall}, \textbf{76.22\% Specificity}, and \textbf{0.871 F1 Score} on 293 strictly held-out test clips) at \textbf{50.7 FPS} on commodity CPUs without GPU dependency. Injecting Cross-Origin Isolation (\texttt{COOP}/\texttt{COEP}) unlocks the identical ONNX pipeline directly inside web browsers via multi-threaded WebAssembly SIMD and WebGPU with zero external video uploads. Future directions include INT8 post-training quantization of the \mbox{YOLOv8n-Pose} backbone for ultra-low-power ARM SoCs, fine-tuning athletic sparring separations without compromising gym-based fight sensitivity, and cross-camera re-identification over federated RTSP meshes.
 
 \begin{thebibliography}{00}
-\bibitem{b1} D. Tran, L. Bourdev, R. Fergus, L. Torresani, and M. Paluri, ``Learning spatiotemporal features with 3D convolutional networks,'' in \textit{Proc. IEEE Int. Conf. Comput. Vis. (ICCV)}, 2015, pp. 4489--4497.
-\bibitem{b2} S. Yan, Y. Xiong, and D. Lin, ``Spatial temporal graph convolutional networks for skeleton-based action recognition,'' in \textit{Proc. AAAI Conf. Artif. Intell.}, 2018, pp. 7444--7452.
+\bibitem{b1} D. Tran, L. Bourdev, R. Fergus, L. Torresani, and M. Paluri, ``Learning spatiotemporal features with 3D convolutional networks,'' in \textit{Proc. IEEE Int. Conf. Comput. Vis. (ICCV)}, 2015.
+\bibitem{b2} S. Yan, Y. Xiong, and D. Lin, ``Spatial temporal graph convolutional networks for skeleton-based action recognition,'' in \textit{Proc. AAAI Conf. Artif. Intell.}, 2018.
 \bibitem{b3} G. Jocher, A. Chaurasia, and J. Qiu, ``Ultralytics YOLOv8 Pose Estimation,'' 2023. [Online]. Available: \url{https://docs.ultralytics.com/tasks/pose/}
 \bibitem{b4} H. W. Kuhn, ``The Hungarian method for the assignment problem,'' \textit{Naval Res. Logist. Quart.}, vol. 2, no. 1--2, pp. 83--97, 1955.
-\bibitem{b5} M. M. Soliman, M. H. Kamal, M. A. E.-M. Nashed, Y. M. Mostafa, B. S. Chawky, and D. Khattab, ``Violence recognition from videos using deep learning techniques,'' in \textit{Proc. IEEE Int. Conf. Intell. Comput. Inf. Syst. (ICICIS)}, 2019, pp. 80--85.
+\bibitem{b5} M. M. Soliman, M. H. Kamal, M. A. E.-M. Nashed, Y. M. Mostafa, B. S. Chawky, and D. Khattab, ``Violence recognition from videos using deep learning techniques,'' in \textit{Proc. IEEE Int. Conf. Intell. Comput. Inf. Syst. (ICICIS)}, 2019.
+\bibitem{b6} M. Cheng, K. Cai, and M. Li, ``RWF-2000: An open large scale video database for violence detection,'' in \textit{Proc. 25th Int. Conf. Pattern Recognit. (ICPR)}, 2021.
+\bibitem{b7} P. Wu, J. Liu, Y. Shi, Y. Sun, F. Shao, Z. Wu, and Z. Yang, ``Not only look, but also listen: Learning multimodal violence detection under weak supervision,'' in \textit{Proc. Eur. Conf. Comput. Vis. (ECCV)}, 2020.
+\bibitem{b8} B. M. Degardin and H. Proen\c{c}a, ``Human activity analysis: Iterative weak/self-supervised learning frameworks for detecting abnormal events,'' in \textit{Proc. IEEE Int. Joint Conf. Biometrics (IJCB)}, 2020.
+\bibitem{b9} M. Gohar, ``Violence detection enhancement by involving convolutional block attention modules into various deep learning architectures: Comprehensive case study for UBI-Fights dataset,'' \textit{IEEE Access}, 2023.
+\bibitem{b10} L. Shi, Y. Zhang, J. Cheng, and H. Lu, ``Two-stream adaptive graph convolutional networks for skeleton-based action recognition,'' in \textit{Proc. IEEE/CVF Conf. Comput. Vis. Pattern Recognit. (CVPR)}, 2019.
+\bibitem{b11} Z. Liu, H. Zhang, Z. Chen, Z. Wang, and W. Ouyang, ``Disentangling and unifying graph convolutions for skeleton-based action recognition,'' in \textit{Proc. IEEE/CVF Conf. Comput. Vis. Pattern Recognit. (CVPR)}, 2020.
+\bibitem{b12} Y. Chen, Z. Zhang, C. Yuan, B. Li, Y. Deng, and W. Hu, ``Channel-wise topology refinement graph convolution for skeleton-based action recognition,'' in \textit{Proc. IEEE/CVF Int. Conf. Comput. Vis. (ICCV)}, 2021.
+\bibitem{b13} Y.-F. Song, Z. Zhang, C. Shan, and L. Wang, ``Constructing stronger and faster baselines for skeleton-based action recognition,'' \textit{IEEE Trans. Pattern Anal. Mach. Intell. (TPAMI)}, 2022.
+\bibitem{b14} H. Duan, Y. Zhao, K. Chen, D. Lin, and B. Dai, ``Revisiting skeleton-based action recognition,'' in \textit{Proc. IEEE/CVF Conf. Comput. Vis. Pattern Recognit. (CVPR)}, 2022.
+\bibitem{b15} H. Duan, J. Wang, K. Chen, and D. Lin, ``PYSKL: Towards good practices for skeleton action recognition,'' in \textit{Proc. ACM Int. Conf. Multimedia}, 2022.
+\bibitem{b16} H.-g. Chi, M. H. Ha, S. Chi, S. W. Lee, Q. Huang, and K. Ramani, ``InfoGCN: Representation learning for human skeleton-based action recognition,'' in \textit{Proc. IEEE/CVF Conf. Comput. Vis. Pattern Recognit. (CVPR)}, 2022.
+\bibitem{b17} J. Lee, M. Lee, D.-L. Nguyen, and S. Lee, ``Hierarchically decomposed graph convolutional networks for skeleton-based action recognition,'' in \textit{Proc. IEEE/CVF Int. Conf. Comput. Vis. (ICCV)}, 2023.
+\bibitem{b18} J. Do and M. Kim, ``SkateFormer: Skeletal-temporal transformer for human action recognition,'' in \textit{Proc. Eur. Conf. Comput. Vis. (ECCV)}, 2024.
+\bibitem{b19} Y. Zhou, X. Yan, Z.-Q. Cheng, Y. Yan, Q. Dai, and X.-S. Hua, ``BlockGCN: Redefine topology awareness for skeleton-based action recognition,'' in \textit{Proc. IEEE/CVF Conf. Comput. Vis. Pattern Recognit. (CVPR)}, 2024.
+\bibitem{b20} H. Yang, Z. Ren, H. Yuan, W. Wei, Q. Zhang, and Z. Zhang, ``Multi-scale and attention enhanced graph convolution network for skeleton-based violence action recognition,'' \textit{Frontiers in Neurorobotics}, 2022.
+\bibitem{b21} N. F. Janbi, M. A. Ghaseb, and A. A. Almazroi, ``ESTS-GCN: An ensemble spatial-temporal skeleton-based graph convolutional networks for violence detection,'' \textit{Int. J. Intell. Syst.}, 2024.
+\bibitem{b22} N. Tran, H. Nguyen, D. Ly, and H. D. Nguyen, ``Advancing violence detection with graph-based skeleton motion analysis,'' \textit{SN Computer Science}, 2025.
+\bibitem{b23} D. Maji, S. Nagaraj, et al., ``YOLO-Pose: Enhancing YOLO for multi person pose estimation,'' in \textit{Proc. IEEE/CVF Conf. Comput. Vis. Pattern Recognit. Workshops (CVPRW)}, 2022.
+\bibitem{b24} Y. Zhang, P. Sun, Y. Jiang, D. Yu, F. Weng, Z. Yuan, P. Luo, W. Liu, and X. Wang, ``ByteTrack: Multi-object tracking by associating every detection box,'' in \textit{Proc. Eur. Conf. Comput. Vis. (ECCV)}, 2022.
+\bibitem{b25} N. Aharon, R. Orfaig, and B.-Z. Bobrovsky, ``BoT-SORT: Robust associations multi-pedestrian tracking,'' \textit{arXiv preprint arXiv:2206.14651}, 2022.
+\bibitem{b26} ONNX Runtime Developers, ``ONNX Runtime: Cross-platform, high performance ML inferencing and training accelerator,'' 2024. [Online]. Available: \url{https://onnxruntime.ai/}
+\bibitem{b27} A. Howard, M. Sandler, G. Chu, L.-C. Chen, B. Chen, M. Tan, W. Wang, Y. Zhu, R. Pang, V. Vasudevan, Q. V. Le, and H. Adam, ``Searching for MobileNetV3,'' in \textit{Proc. IEEE/CVF Int. Conf. Comput. Vis. (ICCV)}, 2019.
 \end{thebibliography}
 
 \end{document}

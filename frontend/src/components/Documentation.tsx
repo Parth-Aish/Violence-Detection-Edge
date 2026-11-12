@@ -38,8 +38,8 @@ const ABLATION_ROWS = [
   },
   {
     config: "Full System (+ MobileNetV3 Scene Gating)",
-    precision: "80.61%",
-    recall: "94.80%",
+    precision: "80.68%",
+    recall: "94.67%",
     f1: "0.871",
     fp: "34 / 143 (23.8%)",
     highlight: true,
@@ -86,7 +86,7 @@ export default function Documentation() {
             0.871
           </div>
           <div className="text-[11px] text-zinc-400 mt-1">
-            80.61% Prec • 94.80% Rec
+            80.68% Prec • 94.67% Rec
           </div>
         </div>
 
@@ -119,7 +119,7 @@ export default function Documentation() {
             Held-Out Accuracy
           </div>
           <div className="text-2xl font-bold text-zinc-100 mt-1 tabular-nums">
-            85.65%
+            85.67%
           </div>
           <div className="text-[11px] text-zinc-400 mt-1">
             293 Unseen Test Clips

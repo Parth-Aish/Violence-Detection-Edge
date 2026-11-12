@@ -18,10 +18,10 @@
 </h3>
 
 <p>
-  <code>Accuracy: 85.65%</code> &nbsp;•&nbsp;
+  <code>Accuracy: 85.67%</code> &nbsp;•&nbsp;
   <code>F1 Score: 0.871</code> &nbsp;•&nbsp;
-  <code>Recall: 94.80%</code> &nbsp;•&nbsp;
-  <code>Precision: 80.61%</code> &nbsp;•&nbsp;
+  <code>Recall: 94.67%</code> &nbsp;•&nbsp;
+  <code>Precision: 80.68%</code> &nbsp;•&nbsp;
   <code>Throughput: 50.7 FPS</code>
 </p>
 
@@ -151,7 +151,7 @@ Evaluated on **1,951 verified clips** from the *Real Life Violence Situations* c
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | Baseline ST-GCN (Raw Pose Graph) | 77.72% | **96.60%** | 70.87% | 0.861 | 42 / 143 (29.4%) |
 | + 8-D Kalman Tracker + Relational Strike Gate | 79.45% | 95.20% | 74.12% | 0.866 | 37 / 143 (25.9%) |
-| **Full System (+ MobileNetV3 Scene Gating)** | **80.61%** | 94.80% | **76.03%** | **0.871** | **34 / 143 (23.8%)** |
+| **Full System (+ MobileNetV3 Scene Gating)** | **80.68%** | 94.67% | **76.22%** | **0.871** | **34 / 143 (23.8%)** |
 
 ```text
 CONFUSION MATRIX (Held-Out Test Set — 293 Videos / 42,192 Frames):
@@ -160,7 +160,7 @@ CONFUSION MATRIX (Held-Out Test Set — 293 Videos / 42,192 Frames):
   Actual Violence (V)           8                 142              150
   Total                       117                 176              293
 
-Accuracy: 85.65% | Precision: 80.61% | Recall: 94.80% | F1 Score: 0.871
+Accuracy: 85.67% | Precision: 80.68% | Recall: 94.67% | F1 Score: 0.871
 ```
 
 > **Operational Notes:**
