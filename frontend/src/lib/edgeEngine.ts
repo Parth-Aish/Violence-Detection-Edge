@@ -17,8 +17,7 @@ import {
   KEYPOINT_COUNT,
   FEATURE_COUNT,
   POSE_IMAGE_SIZE,
-  PRIMARY_PERSON_CONFIDENCE,
-  SECONDARY_PROPOSAL_CONFIDENCE,
+  POSE_CONFIDENCE,
   POSE_NMS_THRESHOLD,
   VIOLENCE_THRESHOLD,
   CONSECUTIVE_TRIGGERS_REQUIRED,
@@ -307,8 +306,10 @@ export class EdgeEngine {
     const feeds: Record<string, ort.Tensor> = {};
     feeds[this.stgcnSession.inputNames[0]] = inputTensor;
     const out = await this.stgcnSession.run(feeds);
-    const outData = out[this.stgcnSession.outputNames[0]].data as Float32Array;
+    const outTensor = out[this.stgcnSession.outputNames[0]];
+    const outData = (await outTensor.getData()) as Float32Array;
     const rawVal = outData[0] ?? 0;
+    try { inputTensor.dispose?.(); outTensor.dispose?.(); } catch { /* noop */ }
 
     // Calibrate raw logit / output matching backend/core/inference.py
     let logit = rawVal;
@@ -397,28 +398,51 @@ export class EdgeEngine {
     feeds[this.poseSession!.inputNames[0]] = inputTensor;
     const out = await this.poseSession!.run(feeds);
     const raw = out[this.poseSession!.outputNames[0]];
-    return this._decodeYolo(raw, width, height, scale, padX, padY);
+    const data = (await raw.getData()) as Float32Array;
+    const dims = raw.dims;
+    try { inputTensor.dispose?.(); raw.dispose?.(); } catch { /* noop */ }
+    return this._decodeYolo(data, dims, width, height, scale, padX, padY);
   }
 
   private _decodeYolo(
-    output: ort.Tensor,
+    data: Float32Array,
+    dims: readonly number[],
     origW: number, origH: number,
     scale: number, padX: number, padY: number,
   ): Detection[] {
-    const data = output.data as Float32Array;
-    const dims = output.dims; // [1, 56, N]
-    const N = dims[2];
-    const ATTRS = dims[1]; // 56 = 4 bbox + 1 conf + 17*3 kps
-    if (ATTRS < 56) return [];
+    if (dims.length < 3) return [];
+
+    // Standard YOLOv8-Pose layout is [1, 56, 2100] (channels-first); handle transposed [1, 2100, 56] too
+    const channelsFirst = dims[1] <= dims[2];
+    const ATTRS = channelsFirst ? dims[1] : dims[2];
+    const N = channelsFirst ? dims[2] : dims[1];
+    if (ATTRS < 55) return [];
+
+    const hasBoxConf = ATTRS >= 56;
+    const kpStart = hasBoxConf ? 5 : 4;
+    const readAttr = (attrIdx: number, anchorIdx: number): number =>
+      channelsFirst ? data[attrIdx * N + anchorIdx] : data[anchorIdx * ATTRS + attrIdx];
 
     const primary: Detection[] = [];
     for (let b = 0; b < N; b++) {
-      const conf = data[4 * N + b];
-      // Use SECONDARY_PROPOSAL_CONFIDENCE (0.18) matching Python backend
-      if (conf < SECONDARY_PROPOSAL_CONFIDENCE) continue;
+      let conf: number;
+      if (hasBoxConf) {
+        conf = readAttr(4, b);
+      } else {
+        let maxKpConf = 0;
+        for (let k = 0; k < KEYPOINT_COUNT; k++) {
+          const kc = readAttr(kpStart + k * 3 + 2, b);
+          if (kc > maxKpConf) maxKpConf = kc;
+        }
+        conf = maxKpConf;
+      }
 
-      const cx = data[0 * N + b], cy = data[1 * N + b];
-      const bw = data[2 * N + b], bh = data[3 * N + b];
+      if (conf < POSE_CONFIDENCE) continue;
+
+      const cx = readAttr(0, b);
+      const cy = readAttr(1, b);
+      const bw = readAttr(2, b);
+      const bh = readAttr(3, b);
 
       const x1 = Math.max(0, Math.min(origW, (cx - bw / 2 - padX) / scale));
       const y1 = Math.max(0, Math.min(origH, (cy - bh / 2 - padY) / scale));
@@ -426,15 +450,16 @@ export class EdgeEngine {
       const y2 = Math.max(0, Math.min(origH, (cy + bh / 2 - padY) / scale));
       const bbox: BBox = { x1, y1, x2, y2, conf };
 
-      // Keypoints — normalised to [0,1] in original frame, preserving [0, 0] missing joints
+      // Keypoints — normalised to [0,1] in original frame, masking low-confidence (< 0.5) as [0, 0]
       const kps = new Float32Array(FEATURE_COUNT);
       for (let k = 0; k < KEYPOINT_COUNT; k++) {
-        const base = (5 + k * 3);
-        const rawKx = data[base * N + b];
-        const rawKy = data[(base + 1) * N + b];
-        if (rawKx === 0 && rawKy === 0) {
-          kps[k * 2]     = 0;
-          kps[k * 2 + 1] = 0;
+        const base = kpStart + k * 3;
+        const rawKx = readAttr(base, b);
+        const rawKy = readAttr(base + 1, b);
+        const kpConf = readAttr(base + 2, b);
+        if (kpConf < 0.5 || (rawKx === 0 && rawKy === 0)) {
+          kps[k * 2]     = 0.0;
+          kps[k * 2 + 1] = 0.0;
           continue;
         }
         const kpx = (rawKx - padX) / scale;
