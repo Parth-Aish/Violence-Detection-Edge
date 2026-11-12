@@ -87,12 +87,46 @@ const SCAN_STEPS = [
   "Aggregating sequence telemetry...",
 ];
 
+function inferVideoMimeType(file?: File | null, url?: string): string {
+  if (file?.type) return file.type;
+  const target = (file?.name || url || "").toLowerCase();
+  if (target.endsWith(".avi")) return "video/x-msvideo";
+  if (target.endsWith(".mov")) return "video/quicktime";
+  if (target.endsWith(".webm")) return "video/webm";
+  if (target.endsWith(".mp4") || target.endsWith(".m4v")) return "video/mp4";
+  return "";
+}
+
 async function runClientSideEdgeInference(
   videoUrl: string,
+  mimeType?: string,
   onProgress?: (status: string, percent: number) => void
 ): Promise<AnalysisReport> {
   if (typeof window === "undefined") {
     throw new Error("Edge inference requires a browser environment.");
+  }
+
+  // Create and configure hidden <video> element BEFORE setting src so browsers do not throttle decoding
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.crossOrigin = "anonymous";
+  video.preload = "auto";
+  video.style.position = "fixed";
+  video.style.width = "1px";
+  video.style.height = "1px";
+  video.style.opacity = "0.001";
+  video.style.pointerEvents = "none";
+  video.style.left = "-9999px";
+
+  // Pre-flight codec validation
+  if (mimeType) {
+    const canPlay = video.canPlayType(mimeType);
+    if (canPlay === "") {
+      throw new Error(
+        "Unsupported video codec for local processing. Please use an H.264 MP4, or switch to Cloud API mode."
+      );
+    }
   }
 
   if (edgeEngine.state !== "ready") {
@@ -101,124 +135,187 @@ async function runClientSideEdgeInference(
   }
   edgeEngine.reset();
 
-  const video = document.createElement("video");
-  video.muted = true;
-  video.playsInline = true;
-  video.preload = "auto";
-  video.src = videoUrl;
+  document.body.appendChild(video);
 
-  await new Promise<void>((resolve, reject) => {
-    const onReady = () => {
-      if (video.readyState >= 2) {
+  try {
+    video.src = videoUrl;
+    video.load();
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
         video.removeEventListener("loadeddata", onReady);
         video.removeEventListener("canplay", onReady);
-        resolve();
-      }
-    };
-    video.addEventListener("loadeddata", onReady);
-    video.addEventListener("canplay", onReady);
-    video.onerror = () => reject(new Error("Unable to decode video stream in browser."));
-    if (video.readyState >= 2) resolve();
-  });
-
-  const duration = video.duration && isFinite(video.duration) ? video.duration : 4.0;
-
-  // Preserve native video aspect ratio (capped at 640px) so letterboxing matches Python backend
-  const maxDim = 640;
-  const vw = video.videoWidth || 640;
-  const vh = video.videoHeight || 480;
-  const downscale = Math.min(1, maxDim / Math.max(vw, vh));
-  const targetWidth = Math.round(vw * downscale);
-  const targetHeight = Math.round(vh * downscale);
-  const canvas = document.createElement("canvas");
-  canvas.width = targetWidth;
-  canvas.height = targetHeight;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  if (!ctx) throw new Error("Canvas 2D context unavailable.");
-
-  // Ensure >= 30 sequential frames across clip so ST-GCN temporal window receives full motion trajectory
-  const sampleFps = 6;
-  const totalFrames = Math.max(30, Math.min(Math.round(duration * sampleFps), 40));
-  const maxSeekTime = Math.max(0, duration - 0.02);
-  const stepTime = totalFrames > 1 ? maxSeekTime / (totalFrames - 1) : 0;
-  const timeline: TimelinePoint[] = [];
-  const incidentTimestamps: number[] = [];
-  let peakProb = 0;
-  let activeBackend = edgeEngine.backend;
-  const tStart = performance.now();
-
-  for (let i = 0; i < totalFrames; i++) {
-    const currentTime = Math.min(maxSeekTime, i * stepTime);
-    if (Math.abs(video.currentTime - currentTime) > 0.005) {
-      await new Promise<void>((resolve) => {
-        let done = false;
-        const cleanup = () => {
-          video.removeEventListener("seeked", onSeeked);
-          clearTimeout(timer);
-        };
-        const onSeeked = () => {
-          if (!done) {
-            done = true;
+        video.removeEventListener("error", onErr);
+        clearTimeout(loadTimer);
+      };
+      const onReady = () => {
+        if (!settled && video.readyState >= 2) {
+          settled = true;
+          cleanup();
+          resolve();
+        }
+      };
+      const onErr = () => {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          const code = video.error?.code;
+          if (code === 3 || code === 4) {
+            reject(
+              new Error(
+                "Unsupported video codec for local processing. Please use an H.264 MP4, or switch to Cloud API mode."
+              )
+            );
+          } else {
+            reject(new Error("Unable to decode video stream in browser."));
+          }
+        }
+      };
+      const loadTimer = setTimeout(() => {
+        if (!settled) {
+          if (video.readyState >= 2) {
+            settled = true;
             cleanup();
             resolve();
-          }
-        };
-        const timer = setTimeout(() => {
-          if (!done) {
-            done = true;
+          } else {
+            settled = true;
             cleanup();
-            resolve();
+            reject(
+              new Error(
+                "Timed out decoding video stream in browser. Please use an H.264 MP4, or switch to Cloud API mode."
+              )
+            );
           }
-        }, 500);
-        video.addEventListener("seeked", onSeeked);
-        video.currentTime = currentTime;
-      });
-    }
+        }
+      }, 10000);
 
-    ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
-    const frameData = ctx.getImageData(0, 0, targetWidth, targetHeight);
-
-    // Force stride=1 on sequentially subsampled client frames to avoid duplicating stale poses
-    const pred = await edgeEngine.processFrame(frameData, 1);
-    activeBackend = pred.backend;
-    const prob = pred?.probability ?? 0;
-    if (prob > peakProb) peakProb = prob;
-
-    const isFighting = pred?.isFighting ?? false;
-    if (isFighting && (incidentTimestamps.length === 0 || currentTime - incidentTimestamps[incidentTimestamps.length - 1] > 0.5)) {
-      incidentTimestamps.push(Number(currentTime.toFixed(2)));
-    }
-
-    timeline.push({
-      timestamp: Number(currentTime.toFixed(2)),
-      probability: Number(prob.toFixed(3)),
-      is_fighting: isFighting,
-      person_count: pred?.personCount ?? 0,
-      bio_score: Number((pred?.bioScore ?? 0).toFixed(2)),
+      video.addEventListener("loadeddata", onReady);
+      video.addEventListener("canplay", onReady);
+      video.addEventListener("error", onErr);
+      if (video.readyState >= 2) onReady();
     });
 
-    const percent = Math.min(95, Math.round(20 + (i / totalFrames) * 75));
-    if (i % 2 === 0 || i === totalFrames - 1) {
-      onProgress?.(`Frame ${i + 1}/${totalFrames} [${activeBackend}]`, percent);
+    const duration = video.duration && isFinite(video.duration) ? video.duration : 4.0;
+
+    // Preserve native video aspect ratio (capped at 640px) so letterboxing matches Python backend
+    const maxDim = 640;
+    const vw = video.videoWidth || 640;
+    const vh = video.videoHeight || 480;
+    const downscale = Math.min(1, maxDim / Math.max(vw, vh));
+    const targetWidth = Math.round(vw * downscale);
+    const targetHeight = Math.round(vh * downscale);
+    const canvas = document.createElement("canvas");
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) throw new Error("Canvas 2D context unavailable.");
+
+    // Ensure >= 30 sequential frames across clip so ST-GCN temporal window receives full motion trajectory
+    const sampleFps = 6;
+    const totalFrames = Math.max(30, Math.min(Math.round(duration * sampleFps), 40));
+    const maxSeekTime = Math.max(0, duration - 0.02);
+    const stepTime = totalFrames > 1 ? maxSeekTime / (totalFrames - 1) : 0;
+    const timeline: TimelinePoint[] = [];
+    const incidentTimestamps: number[] = [];
+    let peakProb = 0;
+    let processedFrames = 0;
+    let activeBackend = edgeEngine.backend;
+    const tStart = performance.now();
+
+    for (let i = 0; i < totalFrames; i++) {
+      const currentTime = Math.min(maxSeekTime, i * stepTime);
+      if (Math.abs(video.currentTime - currentTime) > 0.005) {
+        await new Promise<void>((resolve) => {
+          let done = false;
+          const cleanup = () => {
+            video.removeEventListener("seeked", onSeeked);
+            clearTimeout(timer);
+          };
+          const onSeeked = () => {
+            if (!done) {
+              done = true;
+              cleanup();
+              resolve();
+            }
+          };
+          const timer = setTimeout(() => {
+            if (!done) {
+              done = true;
+              cleanup();
+              resolve();
+            }
+          }, 1500);
+          video.addEventListener("seeked", onSeeked);
+          video.currentTime = currentTime;
+        });
+      }
+
+      let frameData: ImageData;
+      try {
+        ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
+        frameData = ctx.getImageData(0, 0, targetWidth, targetHeight);
+      } catch (drawErr) {
+        console.warn(`Skipping corrupted/unready frame ${i} at ${currentTime.toFixed(2)}s:`, drawErr);
+        continue;
+      }
+
+      // Force stride=1 on sequentially subsampled client frames to avoid duplicating stale poses
+      const pred = await edgeEngine.processFrame(frameData, 1);
+      processedFrames++;
+      activeBackend = pred.backend;
+      const prob = pred?.probability ?? 0;
+      if (prob > peakProb) peakProb = prob;
+
+      const isFighting = pred?.isFighting ?? false;
+      if (isFighting && (incidentTimestamps.length === 0 || currentTime - incidentTimestamps[incidentTimestamps.length - 1] > 0.5)) {
+        incidentTimestamps.push(Number(currentTime.toFixed(2)));
+      }
+
+      timeline.push({
+        timestamp: Number(currentTime.toFixed(2)),
+        probability: Number(prob.toFixed(3)),
+        is_fighting: isFighting,
+        person_count: pred?.personCount ?? 0,
+        bio_score: Number((pred?.bioScore ?? 0).toFixed(2)),
+      });
+
+      const percent = Math.min(95, Math.round(20 + (i / totalFrames) * 75));
+      if (i % 2 === 0 || i === totalFrames - 1) {
+        onProgress?.(`Frame ${i + 1}/${totalFrames} [${activeBackend}]`, percent);
+      }
+    }
+
+    if (processedFrames === 0) {
+      throw new Error(
+        "Unsupported video codec for local processing. Please use an H.264 MP4, or switch to Cloud API mode."
+      );
+    }
+
+    const isViolent = incidentTimestamps.length > 0 || peakProb >= 0.70;
+    const processingTime = Number(((performance.now() - tStart) / 1000).toFixed(2));
+
+    return {
+      overall_verdict: isViolent ? "Violence" : "Safe",
+      confidence: isViolent ? peakProb : Math.max(0.05, 1 - peakProb),
+      incident_timestamps: incidentTimestamps,
+      processing_time_sec: processingTime,
+      frame_count: processedFrames,
+      video_duration_sec: Number(duration.toFixed(1)),
+      video_fps: Number((processedFrames / Math.max(duration, 0.1)).toFixed(1)),
+      peak_probability: Number(peakProb.toFixed(3)),
+      is_sports_context: false,
+      runtime_backend: activeBackend,
+      timeline,
+    };
+  } finally {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+    if (video.parentNode) {
+      video.parentNode.removeChild(video);
     }
   }
-
-  const isViolent = incidentTimestamps.length > 0 || peakProb >= 0.70;
-  const processingTime = Number(((performance.now() - tStart) / 1000).toFixed(2));
-
-  return {
-    overall_verdict: isViolent ? "Violence" : "Safe",
-    confidence: isViolent ? peakProb : Math.max(0.05, 1 - peakProb),
-    incident_timestamps: incidentTimestamps,
-    processing_time_sec: processingTime,
-    frame_count: totalFrames,
-    video_duration_sec: Number(duration.toFixed(1)),
-    video_fps: Number((totalFrames / Math.max(duration, 0.1)).toFixed(1)),
-    peak_probability: Number(peakProb.toFixed(3)),
-    is_sports_context: false,
-    runtime_backend: activeBackend,
-    timeline,
-  };
 }
 
 export default function VisionKinematicsConsole() {
@@ -313,11 +410,22 @@ export default function VisionKinematicsConsole() {
     handleQuickSelect(PRESET_SAMPLES[0]);
   }, []);
 
+  const isAllowedVideoFile = (file: File): boolean => {
+    const lower = file.name.toLowerCase();
+    return (
+      file.type.startsWith("video/") ||
+      lower.endsWith(".mp4") ||
+      lower.endsWith(".avi") ||
+      lower.endsWith(".mov") ||
+      lower.endsWith(".webm")
+    );
+  };
+
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (!file.type.includes("mp4") && !file.name.toLowerCase().endsWith(".mp4")) {
-      setErrorMsg("Unsupported format: please provide an MP4 video file.");
+    if (!isAllowedVideoFile(file)) {
+      setErrorMsg("Unsupported format: please provide an MP4, AVI, MOV, or WebM video file.");
       return;
     }
     processVideoFile(file, null);
@@ -338,8 +446,8 @@ export default function VisionKinematicsConsole() {
     setIsDragOver(false);
     const file = e.dataTransfer.files?.[0];
     if (!file) return;
-    if (!file.name.toLowerCase().endsWith(".mp4")) {
-      setErrorMsg("Unsupported format: please provide an MP4 video file.");
+    if (!isAllowedVideoFile(file)) {
+      setErrorMsg("Unsupported format: please provide an MP4, AVI, MOV, or WebM video file.");
       return;
     }
     processVideoFile(file, null);
@@ -353,13 +461,14 @@ export default function VisionKinematicsConsole() {
 
     try {
       if (inferenceMode === "edge") {
-        setActiveScanStatus("Initializing client ONNX runtime...");
+        setActiveScanStatus("Checking browser video codec compatibility...");
         const videoSourceUrl = previewVideoUrl;
         if (!videoSourceUrl) {
           throw new Error("No video source selected for client inference.");
         }
 
-        const report = await runClientSideEdgeInference(videoSourceUrl, (stage, percent) => {
+        const mimeType = inferVideoMimeType(uploadedFile, videoSourceUrl);
+        const report = await runClientSideEdgeInference(videoSourceUrl, mimeType, (stage, percent) => {
           setActiveScanStatus(`${stage} (${percent}%)`);
         });
         setAnalysisReport(report);
