@@ -139,10 +139,10 @@ export default function Documentation() {
             CPU Throughput (w/ Decode)
           </div>
           <div className="text-2xl font-bold text-indigo-400 mt-1 tabular-nums">
-            48.5 FPS
+            45.4 FPS
           </div>
           <div className="text-[11px] text-zinc-400 mt-1">
-            20.63 ± 13.49 ms (i5-1135G7)
+            22.04 ± 14.87 ms (P50 24.05, P95 48.52)
           </div>
         </div>
 
@@ -171,7 +171,7 @@ export default function Documentation() {
               </h3>
             </div>
             <span className="font-mono text-[10px] text-zinc-500">
-              99.8% DATA REDUCTION
+              &gt;99.9% DIM. REDUCTION
             </span>
           </div>
 

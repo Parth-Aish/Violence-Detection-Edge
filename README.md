@@ -22,7 +22,7 @@
   <code>F1 Score: 0.854</code> &nbsp;•&nbsp;
   <code>Recall: 97.33%</code> &nbsp;•&nbsp;
   <code>Precision: 76.04%</code> &nbsp;•&nbsp;
-  <code>Throughput: 48.5 FPS</code>
+  <code>Throughput: 45.4 FPS</code>
 </p>
 
 <p>
@@ -44,7 +44,7 @@
     <td width="50%" valign="top">
       <h3>🧬 1. ST-GCN &amp; Skeletal Kinematics</h3>
       <p>
-        Discards dense <code>1920×1080×3</code> pixel volumes immediately after pose estimation in favor of compact 17-node COCO topological graphs—achieving a <b>99.8% data reduction</b> while decoupling motion from lighting, clothing, and background clutter.
+        Compresses dense <code>1920×1080×3</code> RGB frames (6.22 MB) into normalized <code>(17, 2)</code> 32-bit float topological graphs (<code>136 B</code> per actor for ST-GCN, parsed from <code>17×3</code> pose triplets)—achieving <b>&gt;99.9% dimensionality reduction</b> while decoupling motion from lighting, clothing, and background clutter.
       </p>
       <ul>
         <li><b>YOLOv8n-Pose (<code>320×320</code> ONNX):</b> Letterboxed RGBA/RGB NCHW extraction with NMS (<code>0.45</code>).</li>
@@ -98,7 +98,7 @@ flowchart LR
     IN["Video Source<br/>(Browser MP4 / Webcam / RTSP)"] --> SPLIT{"Execution Tier"}
     SPLIT -->|"Privacy: High (Client)"| WASM["Browser ONNX Runtime Web<br/>WebGPU / COOP-COEP 4T WASM"]
     SPLIT -->|"Cloud Batch API"| API["FastAPI Microservice<br/>C++ ORT (&lt;512 MB RAM)"]
-    SPLIT -->|"On-Premise Native"| CLI["Python OpenCV HUD<br/>48.5 FPS Real-Time"]
+    SPLIT -->|"On-Premise Native"| CLI["Python OpenCV HUD<br/>45.4 FPS End-to-End"]
 
     WASM --> PIPE
     API --> PIPE
@@ -142,7 +142,7 @@ flowchart LR
 <summary><b>📊 Chronologically Partitioned Evaluation, Unbundled Ablation Study &amp; Confusion Matrix (293 Held-Out Test Videos)</b></summary>
 <br />
 
-Evaluated on **1,951 verified clips** from the *Real Life Violence Situations* corpus partitioned by source-video ID via a frozen chronological **70/15/15 split** ([`backend/data/splits_manifest.json`](backend/data/splits_manifest.json)) to prevent source-level data leakage:
+Evaluated on **1,951 verified MP4 clips** from the 2,000-clip *Real Life Violence Situations* corpus (**49 Non-Violent legacy `.avi` clips** [`NV_602.avi`, `NV_863.avi`–`NV_910.avi`] excluded prior to splitting to standardize on H.264/MP4 streams; near-balanced **1,000 Violent [51.3%]** vs. **951 Non-Violent [48.7%]**), partitioned by source-video ID via a frozen chronological **70/15/15 split** ([`backend/data/splits_manifest.json`](backend/data/splits_manifest.json)) to prevent source-level data leakage:
 - **Training Split (70%):** `1,365` videos
 - **Validation Split (15%):** `293` videos (all thresholds &amp; Relational Strike Gate bounds tuned exclusively here)
 - **Held-Out Test Split (15%):** `293` unseen videos (`45,754` frames; `150` Violent, `143` Non-Violent, `Train ∩ Test = ∅`)
@@ -167,32 +167,29 @@ CONFUSION MATRIX (Held-Out Test Set — 293 Videos / 45,754 Frames):
 Accuracy: 82.94% | Precision: 76.04% | Recall: 97.33% | Specificity: 67.83% | F1 Score: 0.854
 ```
 
-> **Operational Notes:**
+> **Operational &amp; Stratified Analysis Notes:**
 > - **Privacy Posture:** Client-side **Edge Mode** guarantees strict zero-upload video privacy (video stays inside local browser WASM/WebGPU or local OpenCV); **Cloud Mode** operates as a standard FastAPI REST API (`POST /api/analyze_video`) receiving uploaded video payloads for server-side inference.
-> - **Dual-Invariant Strike Gate vs. Naive Centroid:** Requiring both effector-to-target reach (`d_strike <= 0.22*W`) and box overlap (`IoU > 0`) protects against centroid drift under heavy occlusion and wide-limb kicks/punches where body centers stay apart.
+> - **Stratified Error Analysis (Strike Gate vs. Naive Centroid):** In aggregate, scalar Centroid Gating (`59` FPs) rejects 2 additional benign crowded scenes outside `0.22*W`; however, the Relational Strike Gate functions as a *specialized boundary defense*—excelling on wide-limb strikes (`d_strike <= 0.22*W` while torsos stay separated) and asymmetric partial occlusions that perturb box centroids.
 > - **Scene Gating Trade-Off:** MobileNetV3 scene classification raises thresholds (`0.85`) in detected gym/sports settings to drop FPs (`61 -> 46`); disable (`enable_scene_gating=False`) when monitoring high-security athletic venues.
 
 </details>
 
 <details>
-<summary><b>⚡ Hardware Latency Variance &amp; End-to-End Throughput (48.5 FPS CPU)</b></summary>
+<summary><b>⚡ Hardware Latency Variance &amp; Percentiles (45.4 FPS E2E / 61.3 FPS Process-Only CPU)</b></summary>
 <br />
 
-Measured on an **11th Gen Intel Core i5-1135G7 @ 2.40 GHz CPU (4 cores / 8 threads)** over **100 timed iterations (after 10 warm-up iterations)** on `violence_sample.mp4`, explicitly including OpenCV `cv2.VideoCapture.read()` decode &amp; YOLOv8n-Pose extraction:
+Measured on an **11th Gen Intel Core i5-1135G7 @ 2.40 GHz CPU (4 cores / 8 threads)** over **100 timed iterations (after 10 warm-up iterations)** on `violence_sample.mp4`, explicitly including OpenCV `cv2.VideoCapture.read()` decode &amp; YOLOv8n-Pose extraction (**FPS = 1000 / Mean_ms**):
 
-| Pipeline Stage / Profile | Mean ± Std Dev | Rate / Notes |
-| :--- | :---: | :--- |
-| OpenCV Video Decode (`cap.read`) | 6.38 ± 8.35 ms | H.264 / MP4 frame I/O |
-| YOLOv8n-Pose (`320×320` ONNX, 4T) | 29.17 ± 6.25 ms | Keypoint &amp; bbox regression + NMS |
-| Kalman Occlusion Tracker | 0.44 ± 0.13 ms | Analytic block covariance + Hungarian |
-| Torso Normalization &amp; Graph Prep | 2.09 ± 0.43 ms | Mid-hip centering &amp; `[0,0]` masking |
-| ST-GCN Temporal Conv (ONNX) | 0.91 ± 0.59 ms | `30×17` graph convolution (`257 KB`) |
-| Relational Strike Gate | 0.62 ± 0.17 ms | Effector-to-target distance + IoU |
-| End-to-End (Stride-1, 4T w/ Decode) | 39.63 ± 10.78 ms | **25.2 FPS** (every frame decoded) |
-| End-to-End (Stride-2, 1T Cloud w/ Decode) | 22.26 ± 14.54 ms | **44.9 FPS** (single-threaded CPU) |
-| **End-to-End (Stride-2, 4T w/ Decode)** | **20.63 ± 13.49 ms** | **48.5 FPS** (`14.81 ± 13.19 ms` process-only) |
+| Profile (w/ OpenCV Decode) | Mean ± Std Dev | Median (P50) | P95 | FPS (`1000/Mean`) |
+| :--- | :---: | :---: | :---: | :---: |
+| Uniform Stride-1 (4T w/ Decode) | 37.55 ± 14.59 ms | 32.36 ms | 67.53 ms | 26.6 FPS |
+| Strided Cloud (Stride-2, 1T w/ Decode) | 28.74 ± 21.20 ms | 34.36 ms | 58.99 ms | 34.8 FPS |
+| **Strided Edge/Local (Stride-2, 4T w/ Decode)** | **22.04 ± 14.87 ms** | **24.05 ms** | **48.52 ms** | **45.4 FPS** |
+| **Strided Edge/Local (Stride-2, 4T Process-Only)** | **16.32 ± 14.11 ms** | **14.82 ms** | **38.55 ms** | **61.3 FPS** |
 
-Automated continuous-stream regression (`python backend/benchmark_tests.py` concatenating `NV_1.mp4` + `V_1.mp4`): **0 / 66 (0.0%) false alarms**, **1.0000 precision**, while Node.js `onnxruntime-web` WASM parity confirms `peak=0.727` (`Violence`) and `peak=0.217` (`Safe`).
+Per-stage stride-1 breakdown (`Mean ± Std Dev`): OpenCV Decode `6.38 ± 8.35 ms`, YOLOv8n-Pose `29.17 ± 6.25 ms`, Kalman Tracker `0.44 ± 0.13 ms`, Normalization `2.09 ± 0.43 ms`, ST-GCN `0.91 ± 0.59 ms`, Relational Strike Gate `0.62 ± 0.17 ms`.
+
+To evaluate continuous temporal transition stability, a separate live-stream stress test (`python backend/benchmark_tests.py`) concatenating a 66-frame non-violent clip (`NV_1.mp4`) directly into a 103-frame violent clip (`V_1.mp4`) recorded **0 / 66 (0.0%) false-alarm frames** and **1.0000 precision** (distinct from the 293-video held-out test set), while Node.js `onnxruntime-web` WASM parity confirms `peak=0.727` (`Violence`) and `peak=0.217` (`Safe`).
 
 </details>
 
