@@ -110,12 +110,21 @@ async function runClientSideEdgeInference(
   const video = document.createElement("video");
   video.muted = true;
   video.playsInline = true;
+  video.preload = "auto";
   video.src = videoUrl;
 
   await new Promise<void>((resolve, reject) => {
-    video.onloadedmetadata = () => resolve();
+    const onReady = () => {
+      if (video.readyState >= 2) {
+        video.removeEventListener("loadeddata", onReady);
+        video.removeEventListener("canplay", onReady);
+        resolve();
+      }
+    };
+    video.addEventListener("loadeddata", onReady);
+    video.addEventListener("canplay", onReady);
     video.onerror = () => reject(new Error("Unable to load video element for local WASM frame extraction."));
-    if (video.readyState >= 1) resolve();
+    if (video.readyState >= 2) resolve();
   });
 
   const duration = video.duration && isFinite(video.duration) ? video.duration : 4.0;
@@ -137,34 +146,40 @@ async function runClientSideEdgeInference(
 
   const sampleFps = 6;
   const totalFrames = Math.max(16, Math.min(Math.floor(duration * sampleFps), 40));
-  const stepTime = duration / totalFrames;
+  const maxSeekTime = Math.max(0, duration - 0.02);
+  const stepTime = totalFrames > 1 ? maxSeekTime / (totalFrames - 1) : 0;
   const timeline: TimelinePoint[] = [];
   const incidentTimestamps: number[] = [];
   let peakProb = 0;
   const tStart = performance.now();
 
   for (let i = 0; i < totalFrames; i++) {
-    const currentTime = i * stepTime;
-    video.currentTime = currentTime;
-
-    await new Promise<void>((resolve) => {
-      let done = false;
-      const onSeeked = () => {
-        if (!done) {
-          done = true;
+    const currentTime = Math.min(maxSeekTime, i * stepTime);
+    if (Math.abs(video.currentTime - currentTime) > 0.005) {
+      await new Promise<void>((resolve) => {
+        let done = false;
+        const cleanup = () => {
           video.removeEventListener("seeked", onSeeked);
-          resolve();
-        }
-      };
-      video.addEventListener("seeked", onSeeked);
-      setTimeout(() => {
-        if (!done) {
-          done = true;
-          video.removeEventListener("seeked", onSeeked);
-          resolve();
-        }
-      }, 40);
-    });
+          clearTimeout(timer);
+        };
+        const onSeeked = () => {
+          if (!done) {
+            done = true;
+            cleanup();
+            resolve();
+          }
+        };
+        const timer = setTimeout(() => {
+          if (!done) {
+            done = true;
+            cleanup();
+            resolve();
+          }
+        }, 500);
+        video.addEventListener("seeked", onSeeked);
+        video.currentTime = currentTime;
+      });
+    }
 
     ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
     const frameData = ctx.getImageData(0, 0, targetWidth, targetHeight);
