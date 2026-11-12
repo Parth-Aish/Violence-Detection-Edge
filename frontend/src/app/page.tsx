@@ -119,9 +119,17 @@ async function runClientSideEdgeInference(
   });
 
   const duration = video.duration && isFinite(video.duration) ? video.duration : 4.0;
+
+  // Extract at the video's native resolution (capped at 640px to avoid OOM)
+  // so the engine's letterbox normalisation matches the Python backend exactly.
+  // Pre-squishing to 320×320 destroys aspect ratio and shifts keypoint coordinates.
+  const maxDim = 640;
+  const vw = video.videoWidth || 640;
+  const vh = video.videoHeight || 480;
+  const downscale = Math.min(1, maxDim / Math.max(vw, vh));
+  const targetWidth = Math.round(vw * downscale);
+  const targetHeight = Math.round(vh * downscale);
   const canvas = document.createElement("canvas");
-  const targetWidth = 320;
-  const targetHeight = 320;
   canvas.width = targetWidth;
   canvas.height = targetHeight;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });

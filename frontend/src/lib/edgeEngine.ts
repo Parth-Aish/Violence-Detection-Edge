@@ -92,24 +92,62 @@ export class EdgeEngine {
   ): Promise<void> {
     this._state = "loading";
     try {
-      onProgress?.({ stage: "Allocating Client WebAssembly SIMD Runtime..." });
-      ort.env.wasm.numThreads = Math.min(navigator.hardwareConcurrency ?? 4, 4);
+      onProgress?.({ stage: "Probing hardware acceleration (WebGPU → WebGL → WASM SIMD)..." });
+
+      // Configure WASM fallback: SIMD + multi-threading
+      ort.env.wasm.numThreads = Math.min(
+        typeof navigator !== "undefined" && navigator.hardwareConcurrency ? navigator.hardwareConcurrency : 4,
+        4,
+      );
       ort.env.wasm.simd = true;
       ort.env.wasm.wasmPaths = "/ort-wasm/";
 
-      onProgress?.({ stage: "Compiling ONNX WASM Graph Kernels..." });
-      const opts: ort.InferenceSession.SessionOptions = {
-        executionProviders: ["wasm"],
+      // Execution provider fallback chain: WebGPU (GPU) → WebGL (GPU) → WASM SIMD (CPU)
+      const options: ort.InferenceSession.SessionOptions = {
+        executionProviders: ["webgpu", "webgl", "wasm"],
         graphOptimizationLevel: "all",
+        executionMode: "sequential",
       };
+      if (typeof navigator !== "undefined" && navigator.hardwareConcurrency) {
+        (options as any).intraOpNumThreads = Math.min(4, navigator.hardwareConcurrency);
+      }
 
-      [this.poseSession, this.stgcnSession] = await Promise.all([
-        ort.InferenceSession.create("/models/yolov8n-pose.onnx", opts),
-        ort.InferenceSession.create("/models/violence_stgcn.onnx", opts),
-      ]);
+      onProgress?.({ stage: "Compiling ONNX graph kernels (GPU-accelerated if available)..." });
 
-      this._backend = "WASM";
-      onProgress?.({ stage: "Edge Models Ready" });
+      try {
+        [this.poseSession, this.stgcnSession] = await Promise.all([
+          ort.InferenceSession.create("/models/yolov8n-pose.onnx", options),
+          ort.InferenceSession.create("/models/violence_stgcn.onnx", options),
+        ]);
+      } catch (gpuErr) {
+        // Fallback strictly to multi-threaded WASM if WebGPU/WebGL initialization fails on driver
+        console.warn("GPU execution provider initialization failed, falling back to WASM:", gpuErr);
+        const wasmOpts: ort.InferenceSession.SessionOptions = {
+          executionProviders: ["wasm"],
+          graphOptimizationLevel: "all",
+          executionMode: "sequential",
+        };
+        if (typeof navigator !== "undefined" && navigator.hardwareConcurrency) {
+          (wasmOpts as any).intraOpNumThreads = Math.min(4, navigator.hardwareConcurrency);
+        }
+        [this.poseSession, this.stgcnSession] = await Promise.all([
+          ort.InferenceSession.create("/models/yolov8n-pose.onnx", wasmOpts),
+          ort.InferenceSession.create("/models/violence_stgcn.onnx", wasmOpts),
+        ]);
+      }
+
+      // Detect which execution provider was actually selected
+      this._backend = "WASM-SIMD";
+      try {
+        // WebGPU sessions expose an internal property; probe it
+        const poseProvider = (this.poseSession as any)?.handler?.backend;
+        if (typeof poseProvider === "string") {
+          if (poseProvider.toLowerCase().includes("webgpu")) this._backend = "WebGPU";
+          else if (poseProvider.toLowerCase().includes("webgl")) this._backend = "WebGL";
+        }
+      } catch { /* detection is best-effort */ }
+
+      onProgress?.({ stage: `Edge Models Ready (${this._backend})` });
       this._state = "ready";
     } catch (err) {
       this._state = "error";
@@ -284,17 +322,25 @@ export class EdgeEngine {
     return Math.max(0, Math.min(1, isFinite(prob) ? prob : 0));
   }
 
-  // ─── YOLOv8-pose detection ──────────────────────────────────────────────────
-  private async _detectPose(frameData: ImageData): Promise<Detection[]> {
+  /**
+   * Letterbox RGBA ImageData into [1, 3, POSE_IMAGE_SIZE, POSE_IMAGE_SIZE] Float32 NCHW tensor.
+   * Strips the Alpha channel, scales pixels to [0.0, 1.0], and uses (114, 114, 114) padding
+   * matching Python's OpenCV _letterbox + cv2.dnn.blobFromImage preprocessing.
+   */
+  private _preprocessFrameToTensor(frameData: ImageData): {
+    tensor: Float32Array;
+    scale: number;
+    padX: number;
+    padY: number;
+  } {
     const { width, height } = frameData;
 
-    // Letterbox to POSE_IMAGE_SIZE
     const scale = Math.min(POSE_IMAGE_SIZE / width, POSE_IMAGE_SIZE / height);
-    const rw = Math.round(width * scale), rh = Math.round(height * scale);
+    const rw = Math.round(width * scale);
+    const rh = Math.round(height * scale);
     const padX = Math.floor((POSE_IMAGE_SIZE - rw) / 2);
     const padY = Math.floor((POSE_IMAGE_SIZE - rh) / 2);
 
-    // Reuse letterbox canvas
     if (!this.letterboxCanvas) {
       if (typeof OffscreenCanvas !== "undefined") {
         this.letterboxCanvas = new OffscreenCanvas(POSE_IMAGE_SIZE, POSE_IMAGE_SIZE);
@@ -304,14 +350,13 @@ export class EdgeEngine {
         c.height = POSE_IMAGE_SIZE;
         this.letterboxCanvas = c;
       }
-      this.letterboxCtx = this.letterboxCanvas.getContext("2d") as any;
+      this.letterboxCtx = this.letterboxCanvas.getContext("2d", { willReadFrequently: true }) as any;
     }
 
     const ctx = this.letterboxCtx!;
     ctx.fillStyle = "rgb(114,114,114)";
     ctx.fillRect(0, 0, POSE_IMAGE_SIZE, POSE_IMAGE_SIZE);
 
-    // Reuse source canvas
     if (!this.srcCanvas || this.srcCanvas.width !== width || this.srcCanvas.height !== height) {
       if (typeof OffscreenCanvas !== "undefined") {
         this.srcCanvas = new OffscreenCanvas(width, height);
@@ -321,20 +366,31 @@ export class EdgeEngine {
         c.height = height;
         this.srcCanvas = c;
       }
-      this.srcCtx = this.srcCanvas.getContext("2d") as any;
+      this.srcCtx = this.srcCanvas.getContext("2d", { willReadFrequently: true }) as any;
     }
     this.srcCtx!.putImageData(frameData, 0, 0);
     ctx.drawImage(this.srcCanvas, padX, padY, rw, rh);
     const imgData = ctx.getImageData(0, 0, POSE_IMAGE_SIZE, POSE_IMAGE_SIZE);
 
-    // Pre-allocated RGB float tensor [1,3,320,320]
+    // Transpose HWC (RGBA) -> NCHW (RGB), strip Alpha channel, divide by 255.0
     const tensor = this.inputTensorBuffer;
+    const rgba = imgData.data;
     const planeSize = POSE_IMAGE_SIZE * POSE_IMAGE_SIZE;
+    const inv255 = 1.0 / 255.0;
     for (let i = 0; i < planeSize; i++) {
-      tensor[i]                 = imgData.data[i * 4]     / 255;
-      tensor[planeSize + i]     = imgData.data[i * 4 + 1] / 255;
-      tensor[2 * planeSize + i] = imgData.data[i * 4 + 2] / 255;
+      const idx4 = i << 2;
+      tensor[i]                 = rgba[idx4]     * inv255; // R plane
+      tensor[planeSize + i]     = rgba[idx4 + 1] * inv255; // G plane
+      tensor[2 * planeSize + i] = rgba[idx4 + 2] * inv255; // B plane
     }
+
+    return { tensor, scale, padX, padY };
+  }
+
+  // ─── YOLOv8-pose detection ──────────────────────────────────────────────────
+  private async _detectPose(frameData: ImageData): Promise<Detection[]> {
+    const { width, height } = frameData;
+    const { tensor, scale, padX, padY } = this._preprocessFrameToTensor(frameData);
 
     const inputTensor = new ort.Tensor("float32", tensor, [1, 3, POSE_IMAGE_SIZE, POSE_IMAGE_SIZE]);
     const feeds: Record<string, ort.Tensor> = {};
@@ -370,12 +426,19 @@ export class EdgeEngine {
       const y2 = Math.max(0, Math.min(origH, (cy + bh / 2 - padY) / scale));
       const bbox: BBox = { x1, y1, x2, y2, conf };
 
-      // Keypoints — normalised to [0,1] in original frame
+      // Keypoints — normalised to [0,1] in original frame, preserving [0, 0] missing joints
       const kps = new Float32Array(FEATURE_COUNT);
       for (let k = 0; k < KEYPOINT_COUNT; k++) {
         const base = (5 + k * 3);
-        const kpx = (data[base * N + b] - padX) / scale;
-        const kpy = (data[(base + 1) * N + b] - padY) / scale;
+        const rawKx = data[base * N + b];
+        const rawKy = data[(base + 1) * N + b];
+        if (rawKx === 0 && rawKy === 0) {
+          kps[k * 2]     = 0;
+          kps[k * 2 + 1] = 0;
+          continue;
+        }
+        const kpx = (rawKx - padX) / scale;
+        const kpy = (rawKy - padY) / scale;
         kps[k * 2]     = Math.max(0, Math.min(1, kpx / Math.max(origW, 1)));
         kps[k * 2 + 1] = Math.max(0, Math.min(1, kpy / Math.max(origH, 1)));
       }
