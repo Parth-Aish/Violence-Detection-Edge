@@ -151,13 +151,15 @@ class PoseSTGCNDetector:
         enable_scene_gating: bool = True,
     ):
         base_dir = Path(__file__).resolve().parent.parent
+        repo_root = base_dir.parent
 
-        # Locate ST-GCN model
+        # Locate ST-GCN model (canonical single source: frontend/public/models or built frontend/out/models)
         candidate_models = [
             Path(model_path) if model_path else None,
             Path(os.environ.get("STGCN_MODEL_PATH", "")) if os.environ.get("STGCN_MODEL_PATH") else None,
-            base_dir / "models" / "violence_stgcn.onnx",
-            base_dir / "violence_stgcn.onnx",
+            Path(os.environ.get("ONNX_MODEL_PATH", "")) if os.environ.get("ONNX_MODEL_PATH") else None,
+            repo_root / "frontend" / "public" / "models" / "violence_stgcn.onnx",
+            repo_root / "frontend" / "out" / "models" / "violence_stgcn.onnx",
         ]
         chosen_model = next((p for p in candidate_models if p and p.is_file()), None)
         if not chosen_model:
@@ -170,7 +172,8 @@ class PoseSTGCNDetector:
         candidate_poses = [
             Path(pose_model_path) if pose_model_path else None,
             Path(os.environ.get("POSE_MODEL_PATH", "")) if os.environ.get("POSE_MODEL_PATH") else None,
-            base_dir / "yolov8n-pose.onnx",
+            repo_root / "frontend" / "public" / "models" / "yolov8n-pose.onnx",
+            repo_root / "frontend" / "out" / "models" / "yolov8n-pose.onnx",
         ]
         chosen_pose = next((p for p in candidate_poses if p and p.is_file()), None)
         if not chosen_pose:
@@ -648,7 +651,3 @@ class PoseSTGCNDetector:
             "is_sports_context": bool(self._is_sports_context),
             "timeline": timeline,
         }
-
-
-# Alias for backwards compatibility
-PoseLSTMDetector = PoseSTGCNDetector

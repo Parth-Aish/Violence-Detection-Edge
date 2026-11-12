@@ -149,13 +149,6 @@ def export_stgcn_to_onnx(
     )
     LOGGER.info("Successfully exported ONNX ST-GCN model to: %s", output_onnx_path)
 
-    fallback_path = output_onnx_path.parent.parent / "violence_stgcn.onnx"
-    try:
-        shutil.copyfile(output_onnx_path, fallback_path)
-        LOGGER.info("Copied ONNX model to fallback path: %s", fallback_path)
-    except Exception as e:
-        LOGGER.warning("Could not copy to fallback path: %s", e)
-
 
 def train_stgcn(
     data_dir: Path,
@@ -364,7 +357,7 @@ def main() -> int:
     parser.add_argument(
         "--output-onnx",
         type=Path,
-        default=Path("backend/models/violence_stgcn.onnx"),
+        default=Path("frontend/public/models/violence_stgcn.onnx"),
     )
     parser.add_argument(
         "--manifest",

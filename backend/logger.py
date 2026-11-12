@@ -16,7 +16,7 @@ from typing import Optional
 try:
     from core.inference import Severity, ViolencePrediction
 except ImportError:
-    from inference import Severity, ViolencePrediction
+    from backend.core.inference import Severity, ViolencePrediction
 
 logger = logging.getLogger("incident_logger")
 DATA_DIR = Path(__file__).parent / "data"
@@ -177,7 +177,6 @@ class IncidentLogger:
         details: str = "",
     ) -> Optional[dict]:
         """Record an incident identified during batch video analysis."""
-        from inference import Severity, ViolencePrediction
         sev = Severity.HIGH if probability >= 0.8 else Severity.MEDIUM
         pred = ViolencePrediction(
             is_fighting=True,

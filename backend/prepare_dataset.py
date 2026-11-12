@@ -152,7 +152,7 @@ def prepare_dataset(
     import onnxruntime as ort
 
     if not pose_model_path:
-        pose_model_path = _project_root / "backend" / "yolov8n-pose.onnx"
+        pose_model_path = _project_root / "frontend" / "public" / "models" / "yolov8n-pose.onnx"
     if not pose_model_path.is_file():
         raise FileNotFoundError(f"YOLOv8-Pose model not found at: {pose_model_path}")
 

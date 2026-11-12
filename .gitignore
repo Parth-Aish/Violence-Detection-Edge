@@ -13,17 +13,12 @@ build/
 venv/
 env/
 
-# YOLOv8 & ST-GCN model weights
+# YOLOv8 & ST-GCN model weights (single canonical location in frontend/public/models/)
 *.pt
 *.onnx
-!backend/yolov8n-pose.onnx
-!backend/models/violence_stgcn.onnx
-!backend/models/violence_stgcn.onnx.data
-!backend/violence_stgcn.onnx
-!backend/violence_stgcn.onnx.data
+*.onnx.data
 !frontend/public/models/yolov8n-pose.onnx
 !frontend/public/models/violence_stgcn.onnx
-!frontend/public/models/violence_stgcn.onnx.data
 *.engine
 runs/
 

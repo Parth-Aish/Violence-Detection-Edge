@@ -29,7 +29,6 @@ from core.inference import (
     CONSECUTIVE_TRIGGERS_REQUIRED,
     DEFAULT_POSE_STRIDE,
     POSE_STRIDE,
-    PoseLSTMDetector,
     PoseSTGCNDetector,
 )
 from logger import IncidentLogger
@@ -45,7 +44,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-_classifier: Optional[PoseLSTMDetector] = None
+_classifier: Optional[PoseSTGCNDetector] = None
 _incident_logger: Optional[IncidentLogger] = None
 _analysis_lock = asyncio.Lock()
 
@@ -207,7 +206,6 @@ async def health_check() -> dict[str, Any]:
         "violence_threshold": _classifier.threshold if _classifier else None,
         "pose_model": str(_classifier.pose_model_path) if _classifier else None,
         "stgcn_model": str(_classifier.model_path) if _classifier else None,
-        "lstm_model": str(_classifier.model_path) if _classifier else None,
         "ort_threads": _classifier.intra_op_threads if _classifier else None,
         "alert_hold_frames": ALERT_HOLD_FRAMES,
         "consecutive_triggers_required": CONSECUTIVE_TRIGGERS_REQUIRED,

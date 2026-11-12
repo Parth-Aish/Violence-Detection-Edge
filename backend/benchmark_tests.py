@@ -20,7 +20,7 @@ _backend_dir = str(Path(__file__).resolve().parent)
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
-from core.inference import PoseSTGCNDetector, PoseLSTMDetector
+from core.inference import PoseSTGCNDetector
 
 
 def locate_sample(name: str, fallback_candidates: list[Path]) -> Path:
