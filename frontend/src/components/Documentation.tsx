@@ -22,26 +22,58 @@ python backend/run_live.py --source 0`;
 const ABLATION_ROWS = [
   {
     config: "Baseline ST-GCN (Raw Pose Graph)",
-    precision: "77.72%",
-    recall: "96.60%",
-    f1: "0.861",
-    fp: "42 / 143 (29.4%)",
+    precision: "69.86%",
+    recall: "97.33%",
+    f1: "0.813",
+    fp: "63 / 143 (44.1%)",
     highlight: false,
   },
   {
-    config: "+ 8-D Kalman Tracker + Relational Strike Gate",
-    precision: "79.45%",
-    recall: "95.20%",
-    f1: "0.866",
-    fp: "37 / 143 (25.9%)",
+    config: "+ Kalman Tracking (only)",
+    precision: "69.19%",
+    recall: "97.33%",
+    f1: "0.809",
+    fp: "65 / 143 (45.5%)",
+    highlight: false,
+  },
+  {
+    config: "+ Naive Centroid Gate (d ≤ 0.22W)",
+    precision: "69.86%",
+    recall: "97.33%",
+    f1: "0.813",
+    fp: "63 / 143 (44.1%)",
+    highlight: false,
+  },
+  {
+    config: "+ Relational Strike Gate (only)",
+    precision: "70.19%",
+    recall: "97.33%",
+    f1: "0.816",
+    fp: "62 / 143 (43.4%)",
+    highlight: false,
+  },
+  {
+    config: "+ Tracking + Naive Centroid Gate",
+    precision: "71.22%",
+    recall: "97.33%",
+    f1: "0.823",
+    fp: "59 / 143 (41.3%)",
+    highlight: false,
+  },
+  {
+    config: "+ Tracking + Strike Gate (Cloud Config)",
+    precision: "70.53%",
+    recall: "97.33%",
+    f1: "0.818",
+    fp: "61 / 143 (42.7%)",
     highlight: false,
   },
   {
     config: "Full System (+ MobileNetV3 Scene Gating)",
-    precision: "80.68%",
-    recall: "94.67%",
-    f1: "0.871",
-    fp: "34 / 143 (23.8%)",
+    precision: "76.04%",
+    recall: "97.33%",
+    f1: "0.854",
+    fp: "46 / 143 (32.2%)",
     highlight: true,
   },
 ];
@@ -83,34 +115,34 @@ export default function Documentation() {
             Held-Out F1 Score
           </div>
           <div className="text-2xl font-bold text-emerald-400 mt-1 tabular-nums">
-            0.871
+            0.854
           </div>
           <div className="text-[11px] text-zinc-400 mt-1">
-            80.68% Prec • 94.67% Rec
+            76.04% Prec • 97.33% Rec
           </div>
         </div>
 
         <div className="rounded-lg border border-zinc-800 bg-[#111114] p-4">
           <div className="text-[10px] uppercase tracking-wider text-zinc-500">
-            Zero-Leakage Corpus
+            Source-Partitioned Corpus
           </div>
           <div className="text-2xl font-bold text-zinc-100 mt-1 tabular-nums">
             1,951 Videos
           </div>
           <div className="text-[11px] text-zinc-400 mt-1">
-            70/15/15 Source-ID Split
+            70/15/15 Chronological Split
           </div>
         </div>
 
         <div className="rounded-lg border border-zinc-800 bg-[#111114] p-4">
           <div className="text-[10px] uppercase tracking-wider text-zinc-500">
-            Native Throughput
+            CPU Throughput (w/ Decode)
           </div>
           <div className="text-2xl font-bold text-indigo-400 mt-1 tabular-nums">
-            50.7 FPS
+            48.5 FPS
           </div>
           <div className="text-[11px] text-zinc-400 mt-1">
-            16.9ms Model Pipeline
+            20.63 ± 13.49 ms (i5-1135G7)
           </div>
         </div>
 
@@ -119,7 +151,7 @@ export default function Documentation() {
             Held-Out Accuracy
           </div>
           <div className="text-2xl font-bold text-zinc-100 mt-1 tabular-nums">
-            85.67%
+            82.94%
           </div>
           <div className="text-[11px] text-zinc-400 mt-1">
             293 Unseen Test Clips
@@ -169,9 +201,11 @@ export default function Documentation() {
                 <code className="font-mono text-zinc-200">
                   [cx, cy, w, h, vx, vy, vw, vh]
                 </code>{" "}
-                paired with Hungarian bipartite matching over an IoU cost matrix
-                maintains continuous actor IDs across up to 10 occluded frames
-                during grapples and clinches.
+                paired with Hungarian bipartite matching ({" "}
+                <code className="font-mono text-zinc-200">max_age=10</code>);
+                qualitative validation indicates it preserves track identities
+                across transient occlusions and reduces ID switches vs. greedy
+                IoU matching.
               </p>
             </div>
 
@@ -206,7 +240,7 @@ export default function Documentation() {
                 </h3>
               </div>
               <span className="font-mono text-[10px] text-zinc-500">
-                NO DATA LEAKAGE
+                SOURCE-ID SPLIT
               </span>
             </div>
 
@@ -281,7 +315,7 @@ export default function Documentation() {
             <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-500">
               <Shield className="h-3.5 w-3.5 text-zinc-400 flex-shrink-0" />
               <span>
-                Supports RTSP streams, USB webcams, and COOP/COEP browser WASM execution.
+                Edge Mode guarantees zero-upload WASM/WebGPU privacy; Cloud Mode acts as a standard FastAPI REST API.
               </span>
             </div>
           </div>

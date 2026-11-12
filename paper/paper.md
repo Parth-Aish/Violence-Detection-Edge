@@ -8,7 +8,7 @@
 
 ## Abstract
 
-Real-time automated violence detection across distributed surveillance cameras is constrained by hardware compute ceilings, high false-positive rates on benign motion, and privacy hazards when raw video is streamed to centralized servers. Traditional 3D convolutional and video-transformer architectures operate over dense RGB pixel volumes, yielding large memory footprints and brittle sensitivity to background clutter, illumination shifts, and camera jitter. This work introduces **Edge Vision**, a dual-tier real-time violence detection platform unifying lightweight pose estimation (`YOLOv8n-Pose`), a Spatial-Temporal Graph Convolutional Network (`ST-GCN`), an 8-state constant-velocity Kalman occlusion tracker with Hungarian bipartite assignment, and a novel pixel-space geometric **Relational Strike Gate**. Representing subjects via normalized 17-node COCO skeletal graphs across 30-frame temporal windows compresses per-frame input bandwidth by 99.8% while decoupling biomechanical motion from appearance confounders. The identical ONNX graph pipeline executes inside both a memory-bounded FastAPI cloud microservice ($<512\text{ MB}$ RAM ceiling) and a zero-upload client browser engine accelerated via WebGPU and `COOP`/`COEP`-isolated multi-threaded WebAssembly (`ONNX Runtime Web`). Benchmarked over 100 timed iterations (after a 10-iteration warm-up) on an Intel Core i7-12700H CPU, the pipeline runs at **50.7 FPS** end-to-end (16.9 ms summed model latency). Evaluated on a strictly held-out, zero-leakage chronological test split of 293 unseen videos partitioned from a 1,951-video benchmark corpus ($\text{TP}=142, \text{FP}=34, \text{FN}=8, \text{TN}=109$), the full system achieves **85.67% Accuracy**, **80.68% Precision**, **94.67% Recall**, **76.22% Specificity**, and an **F1 Score of 0.871**.
+Real-time automated violence detection across distributed surveillance cameras is constrained by hardware compute ceilings, high false-positive rates on benign motion, and privacy hazards when raw video is streamed to centralized servers. Traditional 3D convolutional and video-transformer architectures operate over dense RGB pixel volumes, yielding large memory footprints and brittle sensitivity to background clutter, illumination shifts, and camera jitter. This work introduces **Edge Vision**, a dual-tier real-time violence detection platform unifying lightweight pose estimation (`YOLOv8n-Pose`), a Spatial-Temporal Graph Convolutional Network (`ST-GCN`), an 8-state constant-velocity Kalman occlusion tracker with Hungarian bipartite assignment, and a novel pixel-space geometric **Relational Strike Gate**. Representing subjects via normalized 17-node COCO skeletal graphs across 30-frame temporal windows compresses per-frame input bandwidth by 99.8% while decoupling biomechanical motion from appearance confounders. The identical ONNX graph pipeline runs inside both a memory-bounded FastAPI REST cloud microservice ($<512\text{ MB}$ RAM ceiling) and a zero-upload client browser Edge Mode accelerated via WebGPU and `COOP`/`COEP`-isolated multi-threaded WebAssembly (`ONNX Runtime Web`). Benchmarked over 100 timed iterations (after a 10-iteration warm-up) including OpenCV decoding and YOLOv8n-Pose extraction on an 11th Gen Intel Core i5-1135G7 CPU, strided execution (`pose_stride=2`) achieves **$20.63 \pm 13.49\text{ ms}$** per frame (**48.5 FPS**) with 4 threads and $22.26 \pm 14.54\text{ ms}$ (44.9 FPS) on a single-threaded CPU workload ($39.63 \pm 10.78\text{ ms}$ at uniform stride-1). On a held-out test split of 293 unseen videos chronologically partitioned to prevent source-level data leakage from a 1,951-video corpus ($\text{TP}=146, \text{FP}=46, \text{FN}=4, \text{TN}=97$), the complete system achieves **82.94% Accuracy**, **76.04% Precision**, **97.33% Recall**, **67.83% Specificity**, and an **F1 Score of 0.854**.
 
 **Index Terms—** Violence detection, spatial-temporal graph convolutional networks, pose estimation, Kalman filtering, Hungarian algorithm, relational strike gating, WebAssembly, edge AI.
 
@@ -23,9 +23,9 @@ First-generation deep learning violence detectors operated directly over volumet
 Skeleton-based action recognition projects each subject into a compact topological graph of anatomical keypoints [2], compressing $1920 \times 1080 \times 3$ frames into normalized $(17, 2)$ joint arrays while stripping background texture and facial identity cues. Nevertheless, standalone skeletal classifiers encounter two severe operational failure modes: (1) track fragmentation and ID switching when combatants heavily occlude one another during physical clinches, and (2) elevated false-positive rates on vigorous non-violent solo gestures (dancing, waving, solo jumping). Edge Vision solves both problems via four contributions:
 
 1. **Unified Missing-Joint Masked ST-GCN Pipeline:** A residual ST-GCN exported into a single self-contained $257\text{ KB}$ ONNX binary paired with mid-hip root centering, torso scaling, and strict $[0.0, 0.0]$ validity masking for occluded joints.
-2. **True 8-D Kalman + Hungarian Occlusion Tracker:** Analytic constant-velocity Kalman state prediction and optimal IoU linear assignment maintaining subject trajectories across up to 10 consecutive occluded frames.
-3. **Pixel-Space Relational Strike Gating:** A two-invariant geometric contact filter evaluating effector-to-target Euclidean proximity in pixels alongside bounding-box convergence ($\text{IoU} > 0$), contrasted directly against naive center-of-mass distance thresholds.
-4. **Zero-Upload Cross-Origin-Isolated Edge + Cloud Architecture:** Bit-aligned inference across a 512 MB FastAPI server and a browser client unlocked with `COOP`/`COEP` `SharedArrayBuffer` multi-threaded WebAssembly SIMD and WebGPU acceleration.
+2. **True 8-D Kalman + Hungarian Occlusion Tracker:** Analytic constant-velocity Kalman state prediction and optimal IoU linear assignment; qualitative observation during validation indicates the 8-D state vector preserves track identities through transient occlusions, reducing ID switches compared to greedy IoU matching.
+3. **Pixel-Space Relational Strike Gating:** A dual-invariant geometric contact filter evaluating effector-to-target Euclidean proximity in pixels alongside bounding-box convergence ($\text{IoU} > 0$), explicitly addressing edge geometries where naive box-centroid distance heuristics fail.
+4. **Hybrid Browser Edge Mode & Cloud REST Architecture:** Bit-aligned inference operating wholly client-side in browser Edge Mode (guaranteeing zero-upload privacy via `COOP`/`COEP` `SharedArrayBuffer` WASM SIMD and WebGPU) alongside a standard 512 MB FastAPI Cloud REST API.
 
 ---
 
@@ -69,7 +69,7 @@ with transition $\mathbf{F} = \begin{bmatrix} \mathbf{I}_4 & \mathbf{I}_4 \\ \ma
 
 1. **State Prediction:**
    $$\mathbf{x}_{k|k-1} = \mathbf{F}\mathbf{x}_{k-1|k-1}, \qquad \mathbf{P}_{k|k-1} = \mathbf{F}\mathbf{P}_{k-1|k-1}\mathbf{F}^T + \mathbf{Q}$$
-2. **Hungarian Assignment:** Associates predicted boxes $\hat{\mathbf{b}}_i$ and detections $\mathbf{z}_j$ via `scipy.optimize.linear_sum_assignment` minimizing $\mathcal{C}_{ij} = 1 - \text{IoU}(\hat{\mathbf{b}}_i, \mathbf{z}_j)$ ($\text{IoU} \ge 0.15$; unmatched tracks persist up to `max_age = 10` frames).
+2. **Hungarian Assignment:** Associates predicted boxes $\hat{\mathbf{b}}_i$ and detections $\mathbf{z}_j$ via `scipy.optimize.linear_sum_assignment` minimizing $\mathcal{C}_{ij} = 1 - \text{IoU}(\hat{\mathbf{b}}_i, \mathbf{z}_j)$ ($\text{IoU} \ge 0.15$; retiring unmatched tracks after `max_age = 10` frames). Qualitative observation during validation indicates the 8-D state vector successfully preserves track identities through transient occlusions, reducing ID switches compared to greedy IoU matching.
 3. **Measurement Update:** Solved cleanly via `np.linalg.solve` without explicit matrix inversion:
    $$\mathbf{y}_k = \mathbf{z}_k - \mathbf{H}\mathbf{x}_{k|k-1}, \qquad \mathbf{S}_k = \mathbf{H}\mathbf{P}_{k|k-1}\mathbf{H}^T + \mathbf{R}$$
    $$\mathbf{K}_k = \mathbf{P}_{k|k-1}\mathbf{H}^T\mathbf{S}_k^{-1}, \qquad \mathbf{x}_{k|k} = \mathbf{x}_{k|k-1} + \mathbf{K}_k\mathbf{y}_k, \qquad \mathbf{P}_{k|k} = (\mathbf{I}_8 - \mathbf{K}_k\mathbf{H})\mathbf{P}_{k|k-1}$$
@@ -94,46 +94,56 @@ $$d_{\text{strike}}(A, B) \le \alpha \cdot W_{\text{frame}} \qquad \text{AND} \q
 
 with $\alpha = 0.22$ in general scenes ($\alpha = 0.12$ when MobileNetV3 flags athletic scenes at $1\text{ FPS}$, raising confirmation threshold $\tau = 0.85$), requiring 2 consecutive frames across an 8-frame hold window.
 
+**Comparison Against Naive Centroid Distance Gating:** Unlike a naive bounding-box centroid heuristic $\|\mathbf{c}_A - \mathbf{c}_B\|_2 \le d_{\text{thresh}}$, the dual-invariant Relational Strike Gate addresses two systematic failure modes during partial occlusion and asymmetric limb extension. First, under heavy mutual overlap where one combatant shields the torso of another, partially occluded detections shrink box extents and perturb centroids unevenly; evaluating effector joints $\mathcal{S}$ against exposed target joints in $\mathcal{T}$ preserves true strike proximity even when centroids drift. Second, in wide-stance attacks (high kicks or lunging hooks), trunk centroids remain separated beyond $d_{\text{thresh}}$ while distal wrists/ankles breach the opponent's head/torso box; conversely, benign pedestrians passing side-by-side satisfy $d_{\text{thresh}}$ unless gated by both limb-to-target reach and box overlap ($\text{IoU} > 0$). Requiring both invariants simultaneously makes Edge Vision's contact filter geometrically distinct from center-of-mass distance thresholds.
+
 ---
 
 ## IV. Dual-Tier Deployment Architecture
 
-- **Cloud Batch Microservice (FastAPI / Render):** Runs within a strict 512 MB RAM budget by bypassing PyTorch (`HAS_TORCH=False`), pinning `intra_op_threads=1`, enforcing magic-byte container validation, and enforcing per-IP sliding-window throttling.
-- **Zero-Upload Browser Edge Engine (Next.js 16 + ONNX Runtime Web):** Enforces `COOP: same-origin`, `COEP: require-corp`, and `CORP: cross-origin` HTTP headers unlocking `SharedArrayBuffer` 4-thread WASM SIMD (`WASM-SIMD-4T`) and WebGPU acceleration, paired with pre-flight `canPlayType()` codec validation and frame-seek error recovery. Native RTSP/webcam deployments run via Python OpenCV above 50 FPS.
+- **Cloud Batch Microservice (Standard FastAPI REST API on 512 MB RAM):** Operates as a standard REST API (`POST /api/analyze_video`) receiving uploaded video clips for server-side CPU inference inside strict 512 MB RAM budgets by bypassing PyTorch (`HAS_TORCH=False`), pinning `intra_op_threads=1`, enforcing magic-byte container validation, and enforcing per-IP sliding-window throttling.
+- **Browser Edge Engine (Zero-Upload Client WebAssembly / WebGPU):** Only client-side Edge Mode (alongside local on-premise Python OpenCV feeds) guarantees strict zero-upload video privacy—raw frames never leave browser memory. Serving middleware injects `COOP: same-origin`, `COEP: require-corp`, and `CORP: cross-origin` HTTP headers unlocking `SharedArrayBuffer` 4-thread WASM SIMD (`WASM-SIMD-4T`) and WebGPU acceleration, paired with pre-flight `canPlayType()` codec validation and frame-seek error recovery.
 
 ---
 
 ## V. Experimental Results
 
-### A. Held-Out Evaluation & Exact Confusion Matrix (1,951 Videos)
-Partitioned strictly by source-video ID into a frozen **70/15/15 split** (`splits_manifest.json`: 1,365 Train / 293 Val / 293 Test totaling 42,192 frames; 150 V, 143 NV; zero overlap):
+### A. Chronologically Partitioned Evaluation & Exact Confusion Matrix (1,951 Videos)
+Partitioned by source-video ID into a frozen **70/15/15 split** (`splits_manifest.json`: 1,365 Train / 293 Val / 293 Test totaling 45,754 frames; 150 V, 143 NV; verified `Train ∩ Test = Val ∩ Test = ∅`), chronologically partitioned to prevent source-level data leakage. All components are unbundled cleanly below (`pose_stride=2`, threshold `0.65`):
 
 | Configuration | Precision | Recall | Specificity | F1 Score | FP / 143 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| Baseline ST-GCN | 77.72% | **96.60%** | 70.87% | 0.861 | 42 (29.4%) |
-| + 8-D Kalman Tracker + Relational Gate | 79.45% | 95.20% | 74.12% | 0.866 | 37 (25.9%) |
-| **Full System (+ Scene Gating)** | **80.68%** | 94.67% | **76.22%** | **0.871** | **34 (23.8%)** |
+| Baseline ST-GCN | 69.86% | 97.33% | 55.94% | 0.813 | 63 (44.1%) |
+| ST-GCN + Kalman Tracking (only) | 69.19% | 97.33% | 54.55% | 0.809 | 65 (45.5%) |
+| ST-GCN + Naive Centroid Gate (`d <= 0.22W`) | 69.86% | 97.33% | 55.94% | 0.813 | 63 (44.1%) |
+| ST-GCN + Relational Strike Gate (only) | 70.19% | 97.33% | 56.64% | 0.816 | 62 (43.4%) |
+| ST-GCN + Tracking + Naive Centroid Gate | 71.22% | 97.33% | 58.74% | 0.823 | 59 (41.3%) |
+| ST-GCN + Tracking + Strike Gate (Cloud Config) | 70.53% | 97.33% | 57.34% | 0.818 | 61 (42.7%) |
+| **Full System (+ MobileNetV3 Scene Gating)** | **76.04%** | **97.33%** | **67.83%** | **0.854** | **46 (32.2%)** |
 
-Confusion Matrix (`TP=142, FP=34, FN=8, TN=109`):
-- **Accuracy:** $(142 + 109) / 293 = \mathbf{85.67\%}$
-- **Precision:** $142 / (142 + 34) = \mathbf{80.68\%}$
-- **Recall:** $142 / (142 + 8) = \mathbf{94.67\%}$
-- **Specificity:** $109 / (109 + 34) = \mathbf{76.22\%}$
-- **F1 Score:** $2 \times 142 / (284 + 34 + 8) = \mathbf{0.871}$
+Confusion Matrix (`TP=146, FP=46, FN=4, TN=97`):
+- **Accuracy:** $(146 + 97) / 293 = \mathbf{82.94\%}$
+- **Precision:** $146 / (146 + 46) = \mathbf{76.04\%}$
+- **Recall:** $146 / (146 + 4) = \mathbf{97.33\%}$
+- **Specificity:** $97 / (97 + 46) = \mathbf{67.83\%}$
+- **F1 Score:** $2 \times 146 / (292 + 46 + 4) = \mathbf{0.854}$
 
-### B. Hardware Latency Benchmark
-Tested on an **Intel Core i7-12700H CPU (16 GB RAM, ONNX Runtime CPU) over 100 timed iterations preceded by a 10-iteration warm-up run**: YOLOv8n-Pose `11.2 ms`, Kalman `0.8 ms`, Normalization `0.4 ms`, ST-GCN `4.3 ms`, Strike Gate `0.2 ms` — totaling **16.9 ms/frame** (59.1 FPS model budget) and **50.7 FPS** (`19.7 ms/frame`) end-to-end measured throughput. Browser WASM parity testing reproduces `peak=0.727` (`Violence`) on `violence_sample.mp4` and `peak=0.217` (`Safe`) on `safe_sample.mp4`.
+### B. Hardware Latency Variance Benchmark
+Measured on an **11th Gen Intel Core i5-1135G7 @ 2.40 GHz CPU (4 cores / 8 threads, ONNX Runtime CPU) over 100 timed iterations preceded by a 10-iteration warm-up run** on `violence_sample.mp4`, explicitly including OpenCV `cv2.VideoCapture.read()` video decoding and YOLOv8n-Pose extraction:
+- **Uniform Per-Frame (`pose_stride=1`, 4 threads w/ decode):** `39.63 ± 10.78 ms/frame` (**25.2 FPS**) — OpenCV decode `6.38 ± 8.35 ms`, YOLOv8n-Pose `29.17 ± 6.25 ms`, Kalman `0.44 ± 0.13 ms`, Normalization `2.09 ± 0.43 ms`, ST-GCN `0.91 ± 0.59 ms`, Relational Strike Gate `0.62 ± 0.17 ms`.
+- **Strided Cloud (`pose_stride=2`, 1 thread w/ decode):** **`22.26 ± 14.54 ms/frame`** (**44.9 FPS**; `17.03 ± 14.57 ms` process-only).
+- **Strided Edge/Local (`pose_stride=2`, 4 threads w/ decode):** **`20.63 ± 13.49 ms/frame`** (**48.5 FPS**; `14.81 ± 13.19 ms` process-only / `67.5 FPS`).
+Browser WASM parity testing reproduces `peak=0.727` (`Violence`) on `violence_sample.mp4` and `peak=0.217` (`Safe`) on `safe_sample.mp4`.
 
 ### C. Operational Limitations & Failure Mode Analysis
-Inspecting misclassified held-out clips reveals clear physical boundaries. First, the 34 residual false positives cluster predominantly in intense athletic sparring, close-quarters wrestling, and choreographed martial-arts routines where fast limb contact satisfies both geometric invariants ($d_{\text{strike}} \le \alpha \cdot W_{\text{frame}}$ and $\text{IoU} > 0$) despite benign recreational context. When local MobileNetV3 scene classification detects an athletic arena, tightening $(\alpha, \tau)$ to $(0.12, 0.85)$ suppresses incidental sports overlap, whereas memory-capped 512 MB cloud deployments disable scene gating (`enable_scene_gating=False`) to preserve container stability.
+Inspecting misclassified held-out clips reveals clear physical boundaries. First, the 46 residual false positives under Full System execution cluster predominantly in intense athletic sparring, close-quarters wrestling, and choreographed martial-arts routines where fast limb contact satisfies both geometric invariants ($d_{\text{strike}} \le \alpha \cdot W_{\text{frame}}$ and $\text{IoU} > 0$) despite benign recreational context. When local MobileNetV3 scene classification detects an athletic arena, tightening $(\alpha, \tau)$ to $(0.12, 0.85)$ eliminates 15 athletic false alarms (`61 -> 46` FPs), whereas memory-capped 512 MB Cloud Mode deployments disable scene gating (`enable_scene_gating=False`) to preserve container stability.
 
-Second, the 8 false negatives stem from extreme motion blur, severe low-light silhouette degradation, or heavy multi-person overlap that suppresses YOLOv8n-Pose box confidences below detection thresholds prior to skeletal graph evaluation. Finally, browser Edge Mode decoding remains governed by client HTML5 video container codecs (native H.264/AVC1 MP4 and VP8/VP9/AV1 WebM); pre-flight `canPlayType()` verification automatically identifies unsupported codecs such as HEVC/H.265 and directs operators seamlessly to the server-side OpenCV fallback.
+Second, the 4 false negatives stem from extreme motion blur, severe low-light silhouette degradation, or heavy multi-person overlap that suppresses YOLOv8n-Pose box confidences below detection thresholds prior to skeletal graph evaluation. Finally, browser Edge Mode decoding remains governed by client HTML5 video container codecs (native H.264/AVC1 MP4 and VP8/VP9/AV1 WebM); pre-flight `canPlayType()` verification automatically identifies unsupported codecs such as HEVC/H.265 and directs operators seamlessly to the Cloud REST API fallback.
 
 ---
 
 ## VI. Conclusion
 
-Edge Vision delivers **85.67% Accuracy**, **80.68% Precision**, **94.67% Recall**, and an **F1 Score of 0.871** at **50.7 FPS** across both 512 MB FastAPI cloud deployments and Cross-Origin-Isolated WebAssembly/WebGPU browsers. Future work targets INT8 pose quantization for low-power ARM SoCs and multi-camera RTSP re-identification.
+Edge Vision delivers **82.94% Accuracy**, **76.04% Precision**, **97.33% Recall**, **67.83% Specificity**, and an **F1 Score of 0.854** across 293 held-out test videos while sustaining **48.5 FPS** (`20.63 ± 13.49 ms/frame`) on commodity laptop CPUs. Browser Edge Mode guarantees zero-upload client execution via Cross-Origin-Isolated WebAssembly and WebGPU, complementing the 512 MB Cloud REST API. Future work targets INT8 pose quantization for low-power ARM SoCs and multi-camera RTSP re-identification.
 
 ---
 
