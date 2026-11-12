@@ -20,8 +20,10 @@ import {
   Shield,
   Zap,
   Cloud,
+  BookOpen,
 } from "lucide-react";
 import { edgeEngine } from "@/lib/edgeEngine";
+import Documentation from "@/components/Documentation";
 
 // ─── Data Types ─────────────────────────────────────────────────────────────
 interface TimelinePoint {
@@ -457,7 +459,7 @@ export default function VisionKinematicsConsole() {
   const edgeSnippet = `git clone https://github.com/Parth-Aish/Violence-Detection-Edge.git
 cd Violence-Detection-Edge
 pip install -r requirements.txt
-python run_live.py --source 0`;
+python backend/run_live.py --source 0`;
 
   const copySnippet = () => {
     navigator.clipboard.writeText(edgeSnippet);
@@ -543,6 +545,15 @@ python run_live.py --source 0`;
                   : "API: PROBING"}
               </span>
             </div>
+
+            {/* In-App Documentation Anchor */}
+            <a
+              href="#about-documentation-section"
+              className="flex items-center gap-1.5 rounded border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 px-2.5 py-1 text-zinc-200 transition"
+            >
+              <BookOpen className="h-3 w-3 text-zinc-400" />
+              <span>DOCS &amp; SPECS</span>
+            </a>
           </div>
         </div>
       </header>
@@ -614,6 +625,40 @@ python run_live.py --source 0`;
                     <span>Edge WASM</span>
                   </button>
                 </div>
+              </div>
+
+              {/* Pro-Tip Callout for Long-Form Videos */}
+              <div
+                id="local-execution-protip"
+                className="rounded-md border border-amber-700/60 bg-amber-950/20 px-3.5 py-2.5 text-xs text-zinc-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+              >
+                <div className="flex items-start gap-2.5 leading-relaxed">
+                  <Zap className="h-4 w-4 text-amber-400 flex-shrink-0 mt-0.5" />
+                  <p className="text-[11px] text-zinc-300">
+                    <span className="font-semibold text-amber-300">
+                      Pro-Tip for Long-Form Videos:
+                    </span>{" "}
+                    For videos longer than 30 seconds, explicitly select{" "}
+                    <span className="font-mono text-emerald-300 font-semibold">
+                      Privacy: High (Local WASM)
+                    </span>
+                    . Cloud mode requires uploading heavy payloads over the network, whereas Local
+                    Mode runs instantly on your device&apos;s multi-core CPU/GPU via WebAssembly,
+                    resulting in significantly faster processing and zero network bottleneck.
+                  </p>
+                </div>
+                {inferenceMode !== "edge" && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInferenceMode("edge");
+                      setErrorMsg(null);
+                    }}
+                    className="flex-shrink-0 px-2.5 py-1 rounded text-[11px] font-mono bg-emerald-950/80 hover:bg-emerald-900 text-emerald-300 border border-emerald-700/80 transition self-start sm:self-center"
+                  >
+                    Select Local WASM
+                  </button>
+                )}
               </div>
             </section>
 
@@ -1057,6 +1102,9 @@ python run_live.py --source 0`;
             </section>
           </div>
         </div>
+
+        {/* ── In-App Technical Documentation & Benchmarks ─────────────────── */}
+        <Documentation />
       </main>
     </div>
   );
