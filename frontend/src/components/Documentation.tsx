@@ -130,7 +130,7 @@ export default function Documentation() {
             1,951 Videos
           </div>
           <div className="text-[11px] text-zinc-400 mt-1">
-            70/15/15 Chronological Split
+            70/15/15 Ordered Source-ID Split
           </div>
         </div>
 
@@ -139,10 +139,10 @@ export default function Documentation() {
             CPU Throughput (w/ Decode)
           </div>
           <div className="text-2xl font-bold text-indigo-400 mt-1 tabular-nums">
-            45.4 FPS
+            45.4 Processed FPS
           </div>
           <div className="text-[11px] text-zinc-400 mt-1">
-            22.04 ± 14.87 ms (P50 24.05, P95 48.52)
+            Strided (stride=2) • 22.04 ± 14.87 ms
           </div>
         </div>
 
@@ -171,7 +171,7 @@ export default function Documentation() {
               </h3>
             </div>
             <span className="font-mono text-[10px] text-zinc-500">
-              &gt;99.9% DIM. REDUCTION
+              &gt;99.9% PER-FRAME DIM. RED.
             </span>
           </div>
 
